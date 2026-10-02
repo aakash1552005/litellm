@@ -2,43 +2,41 @@ from contextlib import nullcontext
 
 
 import asyncio
+import json
+import logging
 import os
 import sys
 import types
-import json
-import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Final, List, Literal, Optional, cast
+from typing import Final, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from pydantic import BaseModel, TypeAdapter, ValidationError
-from respx import MockRouter
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
+from prisma.errors import UniqueViolationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
+from respx import MockRouter
 
 import litellm
 from litellm._uuid import uuid
 from litellm.caching.caching import DualCache
-from litellm.integrations.custom_guardrail import CustomGuardrail
-from litellm.proxy.utils import ProxyLogging
 from litellm.constants import UI_SESSION_TOKEN_TEAM_ID
+from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.models.access_group import LiteLLM_AccessGroupTable
 from litellm.models.organization import LiteLLM_OrganizationTable
 from litellm.models.team import LiteLLM_TeamTable
 from litellm.models.user import LiteLLM_UserTable
-from litellm.proxy.management_endpoints import (
-    mcp_management_endpoints as mgmt_endpoints,
-)
-
+from litellm.proxy._experimental.mcp_server.mcp_server_manager import MCPServerConfig, MCPServerManager
+from litellm.proxy._experimental.mcp_server.server_resolution import MCPServerRegistry, ResolvedMCPServer
 from litellm.proxy._types import (
-    LiteLLM_ObjectPermissionTable,
     LiteLLM_MCPServerTable,
+    LiteLLM_ObjectPermissionTable,
     LitellmUserRoles,
     MakeMCPServersPublicRequest,
     MCPTransport,
@@ -47,17 +45,26 @@ from litellm.proxy._types import (
     UpdateMCPServerRequest,
     UserAPIKeyAuth,
 )
-from litellm.proxy._experimental.mcp_server.mcp_server_manager import MCPServerConfig, MCPServerManager
+from litellm.proxy.management_endpoints import (
+    mcp_management_endpoints as mgmt_endpoints,
+)
+from litellm.proxy.utils import ProxyLogging
 from litellm.types.mcp import MCPAuth, MCPCredentials
-from litellm.types.mcp_server.mcp_server_manager import MCPServer, PinnedMCPTool
+from litellm.types.mcp_server.mcp_server_manager import (
+    MCPServer,
+    MCPToolDeprecationRequest,
+    MCPToolVersion,
+    PinMCPServerToolsRequest,
+    PinnedMCPTool,
+)
 
 
 def generate_mock_mcp_server_db_record(
-    server_id: Optional[str] = None,
+    server_id: str | None = None,
     alias: str = "Test DB Server",
     url: str = "https://db-server.example.com/mcp",
     transport: str = "sse",
-    auth_type: Optional[str] = None,
+    auth_type: str | None = None,
     rpm: int | None = None,
 ) -> LiteLLM_MCPServerTable:
     """Generate a mock MCP server record from database"""
@@ -77,11 +84,11 @@ def generate_mock_mcp_server_db_record(
 
 
 def generate_mock_mcp_server_config_record(
-    server_id: Optional[str] = None,
+    server_id: str | None = None,
     name: str = "Test Config Server",
     url: str = "https://config-server.example.com/mcp",
     transport: str = "http",
-    auth_type: Optional[str] = None,
+    auth_type: str | None = None,
 ) -> MCPServer:
     """Generate a mock MCP server record from config.yaml"""
     return MCPServer(
@@ -112,7 +119,7 @@ def generate_mock_user_api_key_auth(
     user_role: LitellmUserRoles = LitellmUserRoles.PROXY_ADMIN,
     user_id: str = "test_user_id",
     api_key: str = "test_api_key",
-    team_id: Optional[str] = None,
+    team_id: str | None = None,
 ) -> UserAPIKeyAuth:
     """Generate a mock UserAPIKeyAuth object"""
     return UserAPIKeyAuth(
@@ -123,7 +130,7 @@ def generate_mock_user_api_key_auth(
     )
 
 
-def generate_mock_team_record(team_id: str, team_alias: str, organization_id: str, mcp_servers: List[str]):
+def generate_mock_team_record(team_id: str, team_alias: str, organization_id: str, mcp_servers: list[str]):
     """Generate a mock team record with object permissions"""
     return MagicMock(
         team_id=team_id,
@@ -136,8 +143,8 @@ def generate_mock_team_record(team_id: str, team_alias: str, organization_id: st
 
 def setup_mock_prisma_client(
     mock_prisma_client: MagicMock,
-    team_records: List[MagicMock],
-    mcp_servers: List[LiteLLM_MCPServerTable],
+    team_records: list[MagicMock],
+    mcp_servers: list[LiteLLM_MCPServerTable],
 ):
     """Helper to set up a mock prisma client with proper async behavior"""
     mock_prisma_client.db = MagicMock()
@@ -224,9 +231,7 @@ async def test_mcp_publication_list_and_detail_derive_current_status(
 
 @pytest.mark.parametrize("approval_status", ("pending_review", "rejected", "draft", "active"))
 @pytest.mark.parametrize("strict", (False, True))
-def test_mcp_publication_projection_excludes_unregistered_lifecycle_records(
-    approval_status: str, strict: bool
-) -> None:
+def test_mcp_publication_projection_excludes_unregistered_lifecycle_records(approval_status: str, strict: bool) -> None:
     from litellm.proxy._experimental.mcp_server.mcp_server_manager import MCPServerManager
 
     record: Final = LiteLLM_MCPServerTable(
@@ -2440,9 +2445,9 @@ class TestTemporaryMCPSessionEndpoints:
     async def test_create_draft_mcp_server_prunes_drafts_past_their_lifetime(self):
         """Regression: abandoned OAuth sessions accumulated forever. Verified against a live
         proxy, where 12 drafts aged past the lifetime were still present and a 13th was added."""
-        from litellm.proxy._experimental.mcp_server.db import create_draft_mcp_server
-
         from datetime import timezone
+
+        from litellm.proxy._experimental.mcp_server.db import create_draft_mcp_server
 
         now = datetime.now(timezone.utc)
         stale_one = generate_mock_mcp_server_db_record(server_id="stale-1")
@@ -4791,8 +4796,7 @@ async def test_health_checks_probe_shared_servers_once_across_auth_contexts(
         for server_id in ("shared", "first", "second", "denied")
     }
     routes: Final = {
-        server_id: respx_mock.get(server.url).respond(401)
-        for server_id, server in manager.registry.items()
+        server_id: respx_mock.get(server.url).respond(401) for server_id, server in manager.registry.items()
     }
     contexts: Final = [
         UserAPIKeyAuth(
@@ -4805,15 +4809,9 @@ async def test_health_checks_probe_shared_servers_once_across_auth_contexts(
         for index, grants in enumerate((("shared", "first"), ("shared", "second")))
     ]
     with (
-        patch.object(
-            mgmt_endpoints, "global_mcp_server_manager", manager
-        ),
-        patch.object(
-            mcp_server_manager, "global_mcp_server_manager", manager
-        ),
-        patch.object(
-            mgmt_endpoints, "build_effective_auth_contexts", AsyncMock(return_value=contexts)
-        ),
+        patch.object(mgmt_endpoints, "global_mcp_server_manager", manager),
+        patch.object(mcp_server_manager, "global_mcp_server_manager", manager),
+        patch.object(mgmt_endpoints, "build_effective_auth_contexts", AsyncMock(return_value=contexts)),
         patch("litellm.proxy.proxy_server.general_settings", {"user_mcp_management_mode": "restricted"}),
     ):
         result: Final = await mgmt_endpoints.health_check_servers(
@@ -4903,14 +4901,14 @@ async def test_health_reachability_requires_explicit_api_opt_in(
     assert response.status_code == 200, response.text
     rows: Final = (
         [HealthResponse.model_validate_json(response.content)]
-        if detail else TypeAdapter(list[HealthResponse]).validate_json(response.content)
+        if detail
+        else TypeAdapter(list[HealthResponse]).validate_json(response.content)
     )
     expected_status: Final = "reachable" if flag == "true" else "unknown"
     assert [row.model_dump() for row in rows] == [{"server_id": server.server_id, "status": expected_status}]
     assert route.call_count == 1
     legacy_parser: Final = (
-        LegacyHealthResponse.model_validate_json
-        if detail else TypeAdapter(list[LegacyHealthResponse]).validate_json
+        LegacyHealthResponse.model_validate_json if detail else TypeAdapter(list[LegacyHealthResponse]).validate_json
     )
     if flag == "true":
         with pytest.raises(ValidationError, match="literal_error"):
@@ -8860,7 +8858,11 @@ class TestPinMCPServerTools:
     """POST/DELETE /v1/mcp/server/{server_id}/pin snapshot and clear the served tool catalog."""
 
     @staticmethod
-    def _pin_patches(stored, store_mock, manager):
+    def _pin_patches(
+        stored: LiteLLM_MCPServerTable | None,
+        store_mock: AsyncMock,
+        manager: MagicMock,
+    ):
         return (
             patch("litellm.proxy.management_endpoints.mcp_management_endpoints.MCP_AVAILABLE", True),
             patch(
@@ -8871,14 +8873,18 @@ class TestPinMCPServerTools:
                 "litellm.proxy.management_endpoints.mcp_management_endpoints.get_mcp_server",
                 AsyncMock(return_value=stored),
             ),
-            patch("litellm.proxy.management_endpoints.mcp_management_endpoints.set_mcp_server_pinned_tools", store_mock),
+            patch(
+                "litellm.proxy.management_endpoints.mcp_management_endpoints.set_mcp_server_pinned_tools", store_mock
+            ),
             patch("litellm.proxy.management_endpoints.mcp_management_endpoints.global_mcp_server_manager", manager),
             patch("litellm.proxy._experimental.mcp_server.rest_endpoints.global_mcp_server_manager", manager),
             patch.dict(
                 sys.modules,
                 {
                     "litellm.proxy.proxy_server": types.SimpleNamespace(
-                        proxy_logging_obj=ProxyLogging(user_api_key_cache=DualCache()), general_settings={}, llm_router=None
+                        proxy_logging_obj=ProxyLogging(user_api_key_cache=DualCache()),
+                        general_settings={},
+                        llm_router=None,
                     )
                 },
             ),
@@ -8954,7 +8960,7 @@ class TestPinMCPServerTools:
         assert listing["raw_headers"] == request.headers
         assert listing["client_ip"] == "10.1.2.3"
         assert store_mock.await_args.args[1:] == ("srv-1", expected)
-        assert store_mock.await_args.kwargs == {"touched_by": "admin"}
+        assert store_mock.await_args.kwargs == {"touched_by": "admin", "changelog": None}
         manager.update_server.assert_awaited_once_with(stored)
         manager.reload_servers_from_database.assert_awaited_once()
 
@@ -8974,7 +8980,7 @@ class TestPinMCPServerTools:
 
         assert result == {"server_id": "srv-1", "status": "unpinned"}
         assert store_mock.await_args.args[1:] == ("srv-1", None)
-        assert store_mock.await_args.kwargs == {"touched_by": "admin"}
+        assert store_mock.await_args.kwargs == {"touched_by": "admin", "changelog": None}
         manager.get_tools_from_server.assert_not_awaited()
         manager.reload_servers_from_database.assert_awaited_once()
 
@@ -9061,6 +9067,611 @@ class TestPinMCPServerTools:
         assert exc.value.status_code == 400
         assert "nothing to pin" in exc.value.detail["error"]
         store_mock.assert_not_awaited()
+
+
+def _resolve_tool_version_server(server_id: str = "srv-1") -> AsyncMock:
+    resolved: Final = mgmt_endpoints.ResolvedMCPServer(
+        table=generate_mock_mcp_server_db_record(server_id=server_id),
+        runtime=None,
+        source="registry",
+    )
+    return AsyncMock(return_value=(resolved, False))
+
+
+class TestMCPToolVersionEndpoints:
+    async def _fetch_tool_versions(
+        self,
+        user: UserAPIKeyAuth,
+        manager: MCPServerManager,
+    ) -> Sequence[MCPToolVersion]:
+        prisma: Final = MagicMock()
+        stored_server: Final = generate_mock_mcp_server_db_record(server_id="srv-1")
+        resolved: Final = mgmt_endpoints.ResolvedMCPServer(table=stored_server, runtime=None, source="db")
+        versions: Final = [
+            MCPToolVersion(
+                server_id="srv-1",
+                tool_name="a",
+                version=1,
+                description="Tool A",
+                input_schema={},
+                change_kind="initial",
+                created_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            ),
+            MCPToolVersion(
+                server_id="srv-1",
+                tool_name="b",
+                version=1,
+                description="Tool B",
+                input_schema={},
+                change_kind="initial",
+                created_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            ),
+        ]
+
+        with (
+            patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=prisma),
+            patch.object(
+                mgmt_endpoints, "_resolve_and_authorize_mcp_server", AsyncMock(return_value=(resolved, False))
+            ),
+            patch.object(mgmt_endpoints, "list_mcp_tool_versions", AsyncMock(return_value=versions)),
+            patch.object(mgmt_endpoints, "_get_allowed_tool_names_for_server", AsyncMock(return_value=None)),
+            patch.object(mgmt_endpoints, "global_mcp_server_manager", manager),
+        ):
+            return await mgmt_endpoints.fetch_mcp_server_tool_versions(
+                request=_make_mock_request(),
+                server_id="srv-1",
+                user_api_key_dict=user,
+            )
+
+    @pytest.mark.asyncio
+    async def test_pin_passes_trimmed_changelog_and_pin_without_body_remains_valid(self):
+        stored: Final = generate_mock_mcp_server_db_record(server_id="srv-1")
+        store_mock: Final = AsyncMock(return_value=stored)
+        manager: Final = TestPinMCPServerTools._manager([("list_notes", "List notes", {})])
+        admin: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin")
+
+        with ExitStack() as stack:
+            for patcher in TestPinMCPServerTools._pin_patches(stored, store_mock, manager):
+                stack.enter_context(patcher)
+            result: Final = await mgmt_endpoints.pin_mcp_server_tools(
+                server_id="srv-1",
+                request=_make_mock_request(),
+                payload=PinMCPServerToolsRequest(changelog="  Updated schema  "),
+                user_api_key_dict=admin,
+            )
+
+        assert result == {"list_notes": PinnedMCPTool(description="List notes", input_schema={})}
+        assert store_mock.await_args.kwargs == {"touched_by": "admin", "changelog": "Updated schema"}
+
+    @pytest.mark.asyncio
+    async def test_get_tool_versions_returns_rows_for_authorized_database_server(self):
+        prisma: Final = MagicMock()
+        server: Final = generate_mock_mcp_server_db_record(server_id="srv-1")
+        resolved: Final = mgmt_endpoints.ResolvedMCPServer(table=server, runtime=None, source="db")
+        version: Final = MCPToolVersion(
+            server_id="srv-1",
+            tool_name="tool_a",
+            version=1,
+            description="List notes",
+            input_schema={},
+            change_kind="initial",
+            created_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+        )
+        rows: Final = [version, version.model_copy(update={"tool_name": "tool_b"})]
+        list_mock: Final = AsyncMock(return_value=rows)
+        admin: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN)
+        allowed_mock: Final = AsyncMock(return_value=None)
+
+        with (
+            patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=prisma),
+            patch.object(mgmt_endpoints, "resolve_mcp_server", AsyncMock(return_value=resolved)),
+            patch.object(mgmt_endpoints, "authorize_mcp_server", AsyncMock(return_value=resolved)),
+            patch.object(mgmt_endpoints, "list_mcp_tool_versions", list_mock),
+            patch.object(mgmt_endpoints, "_get_allowed_tool_names_for_server", allowed_mock),
+            patch.object(mgmt_endpoints, "_user_has_admin_view", return_value=True),
+            patch.object(mgmt_endpoints, "_is_restricted_virtual_key_request", return_value=False),
+            patch.object(mgmt_endpoints, "_get_user_mcp_management_mode", return_value="restricted"),
+            patch.object(mgmt_endpoints, "global_mcp_server_manager", MagicMock()),
+        ):
+            result: Final = await mgmt_endpoints.fetch_mcp_server_tool_versions(
+                request=_make_mock_request(),
+                server_id="srv-1",
+                user_api_key_dict=admin,
+            )
+
+        assert result == rows
+        list_mock.assert_awaited_once_with(prisma, "srv-1", resolved.table.created_at)
+        allowed_mock.assert_awaited_once_with(server_id="srv-1", user_api_key_dict=admin)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("allowed", "expected_names"),
+        ((["tool_a"], ["tool_a"]), ([], []), (None, ["tool_a", "tool_b"])),
+    )
+    async def test_get_tool_versions_filters_rows_by_tool_grants(
+        self,
+        allowed: list[str] | None,
+        expected_names: list[str],
+    ) -> None:
+        prisma: Final = MagicMock()
+        server: Final = generate_mock_mcp_server_db_record(server_id="srv-1")
+        resolved: Final = mgmt_endpoints.ResolvedMCPServer(table=server, runtime=None, source="db")
+        rows: Final = [
+            MCPToolVersion(
+                server_id="srv-1",
+                tool_name="tool_a",
+                version=1,
+                description="Tool A",
+                input_schema={},
+                change_kind="initial",
+                created_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            ),
+            MCPToolVersion(
+                server_id="srv-1",
+                tool_name="tool_b",
+                version=1,
+                description="Tool B",
+                input_schema={},
+                change_kind="initial",
+                created_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            ),
+        ]
+        list_mock: Final = AsyncMock(return_value=rows)
+        admin: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN)
+        allowed_mock: Final = AsyncMock(return_value=allowed)
+
+        with (
+            patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=prisma),
+            patch.object(
+                mgmt_endpoints, "_resolve_and_authorize_mcp_server", AsyncMock(return_value=(resolved, False))
+            ),
+            patch.object(mgmt_endpoints, "list_mcp_tool_versions", list_mock),
+            patch.object(mgmt_endpoints, "_get_allowed_tool_names_for_server", allowed_mock),
+        ):
+            result: Final = await mgmt_endpoints.fetch_mcp_server_tool_versions(
+                request=_make_mock_request(),
+                server_id="srv-1",
+                user_api_key_dict=admin,
+            )
+
+        assert [version.tool_name for version in result] == expected_names
+        allowed_mock.assert_awaited_once_with(server_id="srv-1", user_api_key_dict=admin)
+
+    @pytest.mark.asyncio
+    async def test_get_tool_versions_hides_server_disallowed_tools_from_non_admin(self) -> None:
+        server: Final = generate_mock_mcp_server_config_record(server_id="srv-1").model_copy(
+            update={"disallowed_tools": ["b"]}
+        )
+        manager: Final = MCPServerManager()
+        manager.registry = {"srv-1": server}
+        user: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.INTERNAL_USER)
+
+        result: Final = await self._fetch_tool_versions(user, manager)
+
+        assert [version.tool_name for version in result] == ["a"]
+
+    @pytest.mark.asyncio
+    async def test_get_tool_versions_hides_tools_outside_server_allowlist_from_non_admin(self) -> None:
+        server: Final = generate_mock_mcp_server_config_record(server_id="srv-1").model_copy(
+            update={"allowed_tools": ["a"]}
+        )
+        manager: Final = MCPServerManager()
+        manager.registry = {"srv-1": server}
+        user: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.INTERNAL_USER)
+
+        result: Final = await self._fetch_tool_versions(user, manager)
+
+        assert [version.tool_name for version in result] == ["a"]
+
+    @pytest.mark.asyncio
+    async def test_get_tool_versions_keeps_server_excluded_tools_visible_to_proxy_admin(self) -> None:
+        server: Final = generate_mock_mcp_server_config_record(server_id="srv-1").model_copy(
+            update={"allowed_tools": ["a"]}
+        )
+        manager: Final = MCPServerManager()
+        manager.registry = {"srv-1": server}
+        admin: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+        result: Final = await self._fetch_tool_versions(admin, manager)
+
+        assert [version.tool_name for version in result] == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_get_tool_versions_returns_empty_for_non_admin_when_server_is_unregistered(self) -> None:
+        manager: Final = MCPServerManager()
+        user: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.INTERNAL_USER)
+
+        result: Final = await self._fetch_tool_versions(user, manager)
+
+        assert list(result) == []
+
+    @pytest.mark.asyncio
+    async def test_get_tool_versions_lists_history_for_server_resolved_by_name(self):
+        resolved: Final = mgmt_endpoints.ResolvedMCPServer(
+            table=generate_mock_mcp_server_db_record(server_id="srv-1"),
+            runtime=None,
+            source="registry",
+        )
+        recorded: Final = MCPToolVersion(
+            server_id="srv-1",
+            tool_name="get_forecast",
+            version=1,
+            change_kind="initial",
+            created_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        )
+        list_mock: Final = AsyncMock(return_value=[recorded])
+        prisma: Final = MagicMock()
+        admin: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+        with (
+            patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=prisma),
+            patch.object(
+                mgmt_endpoints,
+                "_resolve_and_authorize_mcp_server",
+                AsyncMock(return_value=(resolved, False)),
+            ),
+            patch.object(mgmt_endpoints, "list_mcp_tool_versions", list_mock),
+            patch.object(mgmt_endpoints, "_get_allowed_tool_names_for_server", AsyncMock(return_value=None)),
+        ):
+            result: Final = await mgmt_endpoints.fetch_mcp_server_tool_versions(
+                request=_make_mock_request(),
+                server_id="weather",
+                user_api_key_dict=admin,
+            )
+
+        assert list(result) == [recorded]
+        list_mock.assert_awaited_once_with(prisma, "srv-1", resolved.table.created_at)
+
+    @pytest.mark.asyncio
+    async def test_get_tool_versions_has_same_non_admin_missing_server_response_as_fetch(self):
+        prisma: Final = MagicMock()
+        not_found: Final = HTTPException(
+            status_code=404,
+            detail={"error": "MCP Server with id missing not found"},
+        )
+        resolve_mock: Final = AsyncMock(return_value=None)
+        authorize_mock: Final = AsyncMock(side_effect=not_found)
+        user: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.INTERNAL_USER)
+
+        with (
+            patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=prisma),
+            patch.object(mgmt_endpoints, "resolve_mcp_server", resolve_mock),
+            patch.object(mgmt_endpoints, "authorize_mcp_server", authorize_mock),
+            patch.object(mgmt_endpoints, "_user_has_admin_view", return_value=False),
+            patch.object(mgmt_endpoints, "_is_restricted_virtual_key_request", return_value=False),
+            patch.object(mgmt_endpoints, "_get_user_mcp_management_mode", return_value="restricted"),
+            patch.object(mgmt_endpoints, "global_mcp_server_manager", MagicMock()),
+        ):
+            with pytest.raises(HTTPException) as versions_error:
+                await mgmt_endpoints.fetch_mcp_server_tool_versions(
+                    request=_make_mock_request(),
+                    server_id="missing",
+                    user_api_key_dict=user,
+                )
+            with pytest.raises(HTTPException) as server_error:
+                await mgmt_endpoints.fetch_mcp_server(
+                    request=_make_mock_request(),
+                    server_id="missing",
+                    user_api_key_dict=user,
+                )
+
+        assert (versions_error.value.status_code, versions_error.value.detail) == (
+            server_error.value.status_code,
+            server_error.value.detail,
+        )
+        assert versions_error.value.status_code == 404
+        assert authorize_mock.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_get_tool_versions_keeps_tool_grant_lookup_in_the_authorization_catalog_snapshot(self):
+        prisma: Final = MagicMock()
+        server: Final = generate_mock_mcp_server_db_record(server_id="srv-1")
+        resolved: Final = mgmt_endpoints.ResolvedMCPServer(table=server, runtime=None, source="db")
+        registered_server: Final = generate_mock_mcp_server_config_record(server_id="srv-1")
+        manager: Final = MCPServerManager()
+        manager.registry = {"srv-1": registered_server}
+        rows: Final = [
+            MCPToolVersion(
+                server_id="srv-1",
+                tool_name="tool_a",
+                version=1,
+                description="Tool A",
+                input_schema={},
+                change_kind="initial",
+                created_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            ),
+            MCPToolVersion(
+                server_id="srv-1",
+                tool_name="tool_b",
+                version=1,
+                description="Tool B",
+                input_schema={},
+                change_kind="initial",
+                created_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            ),
+        ]
+        user: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.INTERNAL_USER)
+        authorization_snapshot: Final = MagicMock()
+        grant_lookup_snapshot: Final = MagicMock()
+
+        async def record_authorization(
+            resolved: ResolvedMCPServer | None,
+            user_api_key_dict: UserAPIKeyAuth,
+            *,
+            manager: MCPServerRegistry,
+            is_admin_view: bool,
+            not_found_detail: Mapping[str, str],
+            forbidden_detail: Mapping[str, str],
+            non_admin_missing: Literal["not_found", "forbidden"],
+            allow_catalog_view: bool = False,
+        ) -> ResolvedMCPServer:
+            authorization_snapshot(mgmt_endpoints.global_mcp_server_manager.catalog.current())
+            assert resolved is not None
+            return resolved
+
+        async def record_grant_lookup(
+            server_id: str,
+            user_api_key_dict: UserAPIKeyAuth,
+        ) -> Sequence[str] | None:
+            grant_lookup_snapshot(mgmt_endpoints.global_mcp_server_manager.catalog.current())
+            return ["tool_a"]
+
+        with (
+            patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=prisma),
+            patch.object(mgmt_endpoints, "resolve_mcp_server", AsyncMock(return_value=resolved)),
+            patch.object(mgmt_endpoints, "authorize_mcp_server", AsyncMock(side_effect=record_authorization)),
+            patch.object(mgmt_endpoints, "list_mcp_tool_versions", AsyncMock(return_value=rows)),
+            patch.object(
+                mgmt_endpoints, "_get_allowed_tool_names_for_server", AsyncMock(side_effect=record_grant_lookup)
+            ),
+            patch.object(mgmt_endpoints, "_user_has_admin_view", return_value=False),
+            patch.object(mgmt_endpoints, "_is_restricted_virtual_key_request", return_value=True),
+            patch.object(mgmt_endpoints, "_get_user_mcp_management_mode", return_value="restricted"),
+            patch.object(mgmt_endpoints, "global_mcp_server_manager", manager),
+        ):
+            result: Final = await mgmt_endpoints.fetch_mcp_server_tool_versions(
+                request=_make_mock_request(),
+                server_id="srv-1",
+                user_api_key_dict=user,
+            )
+
+        authorization_snapshot.assert_called_once()
+        grant_lookup_snapshot.assert_called_once()
+        assert authorization_snapshot.call_args.args[0] is not None
+        assert grant_lookup_snapshot.call_args.args[0] is authorization_snapshot.call_args.args[0]
+        assert [version.tool_name for version in result] == ["tool_a"]
+
+    @pytest.mark.asyncio
+    async def test_put_tool_version_deprecation_is_admin_only_and_returns_updated_version(self):
+        prisma: Final = MagicMock()
+        request: Final = MCPToolDeprecationRequest(
+            sunset_date=datetime(2026, 12, 31, tzinfo=timezone.utc),
+            deprecation_note="Use version 2",
+        )
+        version: Final = MCPToolVersion(
+            server_id="srv-1",
+            tool_name="list_notes",
+            version=1,
+            change_kind="initial",
+            created_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            deprecated_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            sunset_date=request.sunset_date,
+            deprecation_note=request.deprecation_note,
+        )
+        set_mock: Final = AsyncMock(return_value=version)
+        admin: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+        resolver: Final = _resolve_tool_version_server()
+        with (
+            patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=prisma),
+            patch.object(mgmt_endpoints, "_resolve_and_authorize_mcp_server", resolver),
+            patch.object(mgmt_endpoints, "set_mcp_tool_version_deprecation", set_mock),
+        ):
+            result: Final = await mgmt_endpoints.set_tool_version_deprecation(
+                request=_make_mock_request(),
+                server_id="srv-1",
+                tool_name="list_notes",
+                version=1,
+                payload=request,
+                user_api_key_dict=admin,
+            )
+
+        assert result == version
+        set_mock.assert_awaited_once_with(
+            prisma, "srv-1", "list_notes", 1, request, resolver.return_value[0].table.created_at
+        )
+
+    @pytest.mark.asyncio
+    async def test_tool_version_deprecation_targets_server_resolved_by_name(self):
+        prisma: Final = MagicMock()
+        version: Final = MCPToolVersion(
+            server_id="srv-1",
+            tool_name="list_notes",
+            version=1,
+            change_kind="initial",
+            created_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+        )
+        set_mock: Final = AsyncMock(return_value=version)
+        payload: Final = MCPToolDeprecationRequest(deprecation_note="Use version 2")
+        admin: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+        resolver: Final = _resolve_tool_version_server()
+        with (
+            patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=prisma),
+            patch.object(mgmt_endpoints, "_resolve_and_authorize_mcp_server", resolver),
+            patch.object(mgmt_endpoints, "set_mcp_tool_version_deprecation", set_mock),
+        ):
+            updated: Final = await mgmt_endpoints.set_tool_version_deprecation(
+                request=_make_mock_request(),
+                server_id="weather",
+                tool_name="list_notes",
+                version=1,
+                payload=payload,
+                user_api_key_dict=admin,
+            )
+            cleared: Final = await mgmt_endpoints.clear_tool_version_deprecation(
+                request=_make_mock_request(),
+                server_id="weather",
+                tool_name="list_notes",
+                version=1,
+                user_api_key_dict=admin,
+            )
+
+        authorized_at: Final = resolver.return_value[0].table.created_at
+        assert (updated, cleared) == (version, version)
+        assert [call.args for call in set_mock.await_args_list] == [
+            (prisma, "srv-1", "list_notes", 1, payload, authorized_at),
+            (prisma, "srv-1", "list_notes", 1, None, authorized_at),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_put_tool_version_deprecation_rejects_non_admin_and_unknown_versions(self):
+        non_admin: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.INTERNAL_USER)
+        with pytest.raises(HTTPException) as forbidden:
+            await mgmt_endpoints.set_tool_version_deprecation(
+                request=_make_mock_request(),
+                server_id="srv-1",
+                tool_name="list_notes",
+                version=1,
+                payload=MCPToolDeprecationRequest(),
+                user_api_key_dict=non_admin,
+            )
+        assert forbidden.value.status_code == 403
+        assert forbidden.value.detail == {"error": "Admin access required to update MCP tool version deprecation."}
+
+        with (
+            patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=MagicMock()),
+            patch.object(mgmt_endpoints, "_resolve_and_authorize_mcp_server", _resolve_tool_version_server()),
+            patch.object(mgmt_endpoints, "set_mcp_tool_version_deprecation", AsyncMock(return_value=None)),
+        ):
+            with pytest.raises(HTTPException) as missing:
+                await mgmt_endpoints.set_tool_version_deprecation(
+                request=_make_mock_request(),
+                    server_id="srv-1",
+                    tool_name="missing",
+                    version=9,
+                    payload=MCPToolDeprecationRequest(),
+                    user_api_key_dict=generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN),
+                )
+
+        assert missing.value.status_code == 404
+        assert missing.value.detail == {"error": "MCP tool 'missing' version 9 not found for server 'srv-1'."}
+
+    @pytest.mark.asyncio
+    async def test_delete_tool_version_deprecation_is_admin_only_and_clears_metadata(self):
+        prisma: Final = MagicMock()
+        version: Final = MCPToolVersion(
+            server_id="srv-1",
+            tool_name="list_notes",
+            version=1,
+            change_kind="initial",
+            created_at=datetime(2026, 10, 2, tzinfo=timezone.utc),
+        )
+        clear_mock: Final = AsyncMock(return_value=version)
+        admin: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+        resolver: Final = _resolve_tool_version_server()
+        with (
+            patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=prisma),
+            patch.object(mgmt_endpoints, "_resolve_and_authorize_mcp_server", resolver),
+            patch.object(mgmt_endpoints, "set_mcp_tool_version_deprecation", clear_mock),
+        ):
+            result: Final = await mgmt_endpoints.clear_tool_version_deprecation(
+                request=_make_mock_request(),
+                server_id="srv-1",
+                tool_name="list_notes",
+                version=1,
+                user_api_key_dict=admin,
+            )
+
+        assert result == version
+        clear_mock.assert_awaited_once_with(
+            prisma, "srv-1", "list_notes", 1, None, resolver.return_value[0].table.created_at
+        )
+
+        with pytest.raises(HTTPException) as forbidden:
+            await mgmt_endpoints.clear_tool_version_deprecation(
+                request=_make_mock_request(),
+                server_id="srv-1",
+                tool_name="list_notes",
+                version=1,
+                user_api_key_dict=generate_mock_user_api_key_auth(user_role=LitellmUserRoles.INTERNAL_USER),
+            )
+
+        assert forbidden.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_delete_tool_version_deprecation_returns_404_for_unknown_version(self):
+        admin: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN)
+        with (
+            patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=MagicMock()),
+            patch.object(mgmt_endpoints, "_resolve_and_authorize_mcp_server", _resolve_tool_version_server()),
+            patch.object(mgmt_endpoints, "set_mcp_tool_version_deprecation", AsyncMock(return_value=None)),
+        ):
+            with pytest.raises(HTTPException) as missing:
+                await mgmt_endpoints.clear_tool_version_deprecation(
+                request=_make_mock_request(),
+                    server_id="srv-1",
+                    tool_name="missing",
+                    version=9,
+                    user_api_key_dict=admin,
+                )
+
+        assert missing.value.status_code == 404
+        assert missing.value.detail == {"error": "MCP tool 'missing' version 9 not found for server 'srv-1'."}
+
+    @pytest.mark.asyncio
+    async def test_pin_concurrent_version_insert_conflict_returns_409_without_updating_server_row(self):
+        prisma: Final = MagicMock()
+        tx_client: Final = MagicMock()
+        tx_client.execute_raw = AsyncMock()
+        tx_client.litellm_mcpservertable.find_unique = AsyncMock(return_value=MagicMock())
+        tx_client.litellm_mcpservertable.update = AsyncMock()
+        tx_client.litellm_mcptoolversion.find_many = AsyncMock(return_value=[])
+        tx_client.litellm_mcptoolversion.create_many = AsyncMock(
+            side_effect=UniqueViolationError({}, message="unique version")
+        )
+        tx: Final = MagicMock()
+        tx.__aenter__ = AsyncMock(return_value=tx_client)
+        tx.__aexit__ = AsyncMock(return_value=False)
+        prisma.tx = MagicMock(return_value=tx)
+        stored: Final = generate_mock_mcp_server_db_record(server_id="srv-1")
+        manager: Final = TestPinMCPServerTools._manager([("list_notes", "List notes", {})])
+        admin: Final = generate_mock_user_api_key_auth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin")
+
+        try:
+            with (
+                patch.object(mgmt_endpoints, "MCP_AVAILABLE", True),
+                patch.object(mgmt_endpoints, "get_prisma_client_or_throw", return_value=prisma),
+                patch.object(mgmt_endpoints, "get_mcp_server", AsyncMock(return_value=stored)),
+                patch.object(mgmt_endpoints, "global_mcp_server_manager", manager),
+                patch("litellm.proxy._experimental.mcp_server.rest_endpoints.global_mcp_server_manager", manager),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "litellm.proxy.proxy_server": types.SimpleNamespace(
+                            proxy_logging_obj=ProxyLogging(user_api_key_cache=DualCache()),
+                            general_settings={},
+                            llm_router=None,
+                        )
+                    },
+                ),
+            ):
+                with pytest.raises(HTTPException) as conflict:
+                    await mgmt_endpoints.pin_mcp_server_tools(
+                        server_id="srv-1",
+                        request=_make_mock_request(),
+                        user_api_key_dict=admin,
+                    )
+        finally:
+            ProxyLogging._callback_capabilities_cache.clear()
+
+        assert conflict.value.status_code == 409
+        assert conflict.value.detail == {
+            "error": "Another pin of MCP server 'srv-1' recorded tool versions at the same time; retry the pin."
+        }
+        tx_client.litellm_mcptoolversion.create_many.assert_awaited_once()
+        tx_client.litellm_mcpservertable.update.assert_not_awaited()
 
 
 @dataclass(frozen=True)
@@ -9736,14 +10347,14 @@ class TestMCPServerResolutionCharacterization:
         second_id: Final = "lit3974_second_credential"
         prisma, manager, caller = await self._resolution_case("db_runtime", "allowed", first_id)
         ids: Final = (first_id, second_id)
-        rows: Final = tuple(
-            generate_mock_mcp_server_db_record(server_id=sid, alias=f"alias-{sid}") for sid in ids
-        )
+        rows: Final = tuple(generate_mock_mcp_server_db_record(server_id=sid, alias=f"alias-{sid}") for sid in ids)
         prisma.db.litellm_mcpservertable.find_many = AsyncMock(return_value=list(rows))
         auth: Final = caller.model_copy(
-            update={"object_permission": LiteLLM_ObjectPermissionTable(
-                object_permission_id="lit3974_multiple_credentials", mcp_servers=list(ids)
-            )}
+            update={
+                "object_permission": LiteLLM_ObjectPermissionTable(
+                    object_permission_id="lit3974_multiple_credentials", mcp_servers=list(ids)
+                )
+            }
         )
         manager.config_mcp_servers = {
             **manager.config_mcp_servers,
