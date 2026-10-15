@@ -20276,3 +20276,126 @@ async def test_legacy_upstream_elicitation_rejects_modern_downstream_without_con
     finally:
         active_mcp_request_ctx_var.reset(request_token)
         legacy_server.active_mcp_session_var.reset(session_token)
+
+
+def _upstream_http_status_error(status_code: int, headers: dict[str, str] | None = None) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://upstream.example/mcp")
+    return httpx.HTTPStatusError(
+        "upstream rejected",
+        request=request,
+        response=httpx.Response(status_code, headers=headers or {}, request=request),
+    )
+
+
+class TestMCPUpstreamRateLimitRetry:
+    """An upstream 429 on tools/list is retried inside the listing deadline instead of folding
+    into a silent empty outcome on the first attempt."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_tools_with_timeout_retries_429_then_returns_tools(self):
+        manager = MCPServerManager()
+        tool = MCPTool(name="ping", inputSchema={"type": "object"})
+        client = MagicMock()
+        client.list_tools = AsyncMock(
+            side_effect=[
+                _upstream_http_status_error(429, {"Retry-After": "0"}),
+                _upstream_http_status_error(429, {"Retry-After": "0"}),
+                [tool],
+            ]
+        )
+
+        tools = await manager._fetch_tools_with_timeout(client, "flaky-server")
+
+        assert tools == [tool]
+        assert client.list_tools.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_fetch_tools_with_timeout_gives_up_after_max_retries(self):
+        from litellm.constants import MCP_UPSTREAM_RATE_LIMIT_MAX_RETRIES
+
+        manager = MCPServerManager()
+        client = MagicMock()
+        client.list_tools = AsyncMock(side_effect=_upstream_http_status_error(429, {"Retry-After": "0"}))
+
+        with pytest.raises(MCPServerListError) as exc_info:
+            await manager._fetch_tools_with_timeout(client, "saturated-server")
+
+        assert exc_info.value.fault == ServerListFault(tag="upstream_error", status_code=429)
+        assert client.list_tools.await_count == 1 + MCP_UPSTREAM_RATE_LIMIT_MAX_RETRIES
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status_code,exception,fault",
+        [
+            (401, MCPUpstreamAuthError, None),
+            (500, MCPServerListError, ServerListFault(tag="upstream_error", status_code=500)),
+        ],
+    )
+    async def test_fetch_tools_with_timeout_retries_only_429(self, status_code, exception, fault):
+        manager = MCPServerManager()
+        client = MagicMock()
+        client.list_tools = AsyncMock(side_effect=_upstream_http_status_error(status_code))
+
+        with pytest.raises(exception) as exc_info:
+            await manager._fetch_tools_with_timeout(client, "srv")
+
+        if fault is not None:
+            assert exc_info.value.fault == fault
+        assert client.list_tools.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_get_tools_page_retries_429_then_returns_page(self):
+        from mcp.types import ListToolsResult, PaginatedRequestParams
+
+        tool = MCPTool(name="list_notes", inputSchema={"type": "object"})
+        manager = MCPServerManager()
+        server = MCPServer(server_id="notes", name="notes", transport=MCPTransport.http)
+        manager.registry = {server.server_id: server}
+        manager.create_mcp_client = AsyncMock(
+            return_value=SimpleNamespace(
+                _last_initialize_instructions=None,
+                list_tools_page=AsyncMock(
+                    side_effect=[
+                        _upstream_http_status_error(429, {"Retry-After": "0"}),
+                        ListToolsResult(tools=[tool]),
+                    ]
+                ),
+            )
+        )
+
+        result = await manager.get_tools_page(server, params=PaginatedRequestParams())
+
+        assert [t.name for t in result.tools] == ["notes-list_notes"]
+        client = manager.create_mcp_client.return_value
+        assert client.list_tools_page.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_get_tools_page_retry_attempt_is_bounded_by_listing_timeout(self, monkeypatch):
+        import anyio
+        from mcp.types import PaginatedRequestParams
+
+        monkeypatch.setattr(
+            "litellm.proxy._experimental.mcp_server.mcp_server_manager.MCP_TOOL_LISTING_TIMEOUT", 0.2
+        )
+        manager = MCPServerManager()
+        server = MCPServer(server_id="notes", name="notes", transport=MCPTransport.http)
+        manager.registry = {server.server_id: server}
+        calls = 0
+
+        async def list_tools_page(params):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise _upstream_http_status_error(429, {"Retry-After": "0"})
+            await anyio.sleep(3)
+
+        client = SimpleNamespace(_last_initialize_instructions=None, list_tools_page=list_tools_page)
+        manager.create_mcp_client = AsyncMock(return_value=client)
+
+        start: Final = time.monotonic()
+        with pytest.raises(MCPServerListError) as exc_info:
+            await manager.get_tools_page(server, params=PaginatedRequestParams())
+
+        assert time.monotonic() - start < 1.5
+        assert exc_info.value.fault == ServerListFault(tag="upstream_error", status_code=429)
+        assert calls == 2

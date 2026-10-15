@@ -326,3 +326,284 @@ def test_managed_scope_step_up_only_accepts_unambiguous_bearer_challenges(status
     wrapped = RuntimeError("transport failure")
     wrapped.__cause__ = cause
     assert upstream_insufficient_scope(wrapped) == expected
+
+
+def _rate_limited_error(retry_after: str | None = None) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://mcp.example.com/mcp")
+    headers = {"retry-after": retry_after} if retry_after is not None else {}
+    return httpx.HTTPStatusError(
+        "rate limited",
+        request=request,
+        response=httpx.Response(429, headers=headers, request=request),
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_upstream_rate_limit_backs_off_then_reraises():
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import retry_upstream_rate_limit
+
+    sleeps: list[float] = []
+    calls: list[httpx.HTTPStatusError] = []
+    failure = _rate_limited_error()
+
+    async def record(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def always_limited() -> None:
+        calls.append(failure)
+        raise failure
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await retry_upstream_rate_limit(
+            always_limited,
+            "srv",
+            max_retries=3,
+            base_delay=0.5,
+            max_delay=5.0,
+            sleep=record,
+            jitter=lambda: 0.0,
+        )
+
+    assert exc_info.value is failure
+    assert sleeps == [0.5, 1.0, 2.0]
+    assert len(calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_retry_upstream_rate_limit_honors_retry_after_up_to_cap():
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import retry_upstream_rate_limit
+
+    sleeps: list[float] = []
+
+    async def record(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def always_limited() -> None:
+        raise _rate_limited_error("120")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await retry_upstream_rate_limit(
+            always_limited,
+            "srv",
+            max_retries=3,
+            base_delay=0.5,
+            max_delay=5.0,
+            sleep=record,
+            jitter=lambda: 0.0,
+        )
+
+    assert sleeps == [5.0, 5.0, 5.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_upstream_rate_limit_parses_http_date_retry_after():
+    import email.utils
+    import time
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import retry_upstream_rate_limit
+
+    sleeps: list[float] = []
+    attempts: list[None] = []
+
+    async def record(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def limited() -> str:
+        attempts.append(None)
+        if len(attempts) == 1:
+            raise _rate_limited_error(email.utils.formatdate(time.time() + 3, usegmt=True))
+        raise _rate_limited_error("abc")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await retry_upstream_rate_limit(
+            limited,
+            "srv",
+            max_retries=3,
+            base_delay=0.5,
+            max_delay=5.0,
+            sleep=record,
+            jitter=lambda: 0.0,
+        )
+
+    assert 0 < sleeps[0] <= 3.5
+    assert sleeps[1:] == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_upstream_rate_limit_passes_through_non_429():
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import retry_upstream_rate_limit
+
+    sleeps: list[float] = []
+    calls = 0
+    failure = ValueError("broken")
+
+    async def record(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def broken() -> None:
+        nonlocal calls
+        calls += 1
+        raise failure
+
+    with pytest.raises(ValueError, match="broken") as exc_info:
+        await retry_upstream_rate_limit(
+            broken, "srv", max_retries=3, base_delay=0.5, max_delay=5.0, sleep=record, jitter=lambda: 0.0
+        )
+
+    assert exc_info.value is failure
+    assert calls == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_retry_upstream_rate_limit_negative_max_retries_is_a_single_attempt():
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import retry_upstream_rate_limit
+
+    sleeps: list[float] = []
+    calls = 0
+    failure = _rate_limited_error("0")
+
+    async def record(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def always_limited() -> None:
+        nonlocal calls
+        calls += 1
+        raise failure
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await retry_upstream_rate_limit(
+            always_limited,
+            "srv",
+            max_retries=-1,
+            base_delay=0.5,
+            max_delay=5.0,
+            sleep=record,
+            jitter=lambda: 0.0,
+        )
+
+    assert exc_info.value is failure
+    assert calls == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_retry_deadline_skips_sleep_that_would_pass_deadline():
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import retry_upstream_rate_limit
+
+    now = [100.0]
+    sleeps: list[float] = []
+    calls = 0
+    failure = _rate_limited_error()
+
+    async def record(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def always_limited() -> None:
+        nonlocal calls
+        calls += 1
+        raise failure
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await retry_upstream_rate_limit(
+            always_limited,
+            "srv",
+            max_retries=3,
+            base_delay=2.0,
+            max_delay=5.0,
+            sleep=record,
+            jitter=lambda: 0.0,
+            deadline_seconds=1.0,
+            clock=lambda: now[0],
+        )
+
+    assert exc_info.value is failure
+    assert calls == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_retry_attempt_is_interrupted_at_deadline():
+    import anyio
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import retry_upstream_rate_limit
+
+    calls = 0
+    failure = _rate_limited_error("0")
+
+    async def fetch() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise failure
+        await anyio.sleep(5)
+
+    start: Final = anyio.current_time()
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await retry_upstream_rate_limit(
+            fetch, "srv", max_retries=3, base_delay=0.0, max_delay=5.0, deadline_seconds=0.2
+        )
+
+    assert exc_info.value is failure
+    assert anyio.current_time() - start < 1.0
+
+
+@pytest.mark.asyncio
+async def test_retry_deadline_does_not_bound_first_attempt():
+    import anyio
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import retry_upstream_rate_limit
+
+    async def slow() -> str:
+        await anyio.sleep(0.15)
+        return "tools"
+
+    result = await retry_upstream_rate_limit(
+        slow, "srv", max_retries=3, base_delay=0.5, max_delay=5.0, deadline_seconds=0.05
+    )
+
+    assert result == "tools"
+
+
+@pytest.mark.asyncio
+async def test_retry_upstream_rate_limit_never_retries_cancellation():
+    import asyncio
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import retry_upstream_rate_limit
+
+    sleeps: list[float] = []
+    calls = 0
+
+    async def record(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def cancelled() -> None:
+        nonlocal calls
+        calls += 1
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await retry_upstream_rate_limit(
+            cancelled, "srv", max_retries=3, base_delay=0.5, max_delay=5.0, sleep=record, jitter=lambda: 0.0
+        )
+
+    assert calls == 1
+    assert sleeps == []
+
+
+def test_listing_failed_outright_only_when_every_server_faulted_non_auth():
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import (
+        ServerListOk,
+        listing_failed_outright,
+    )
+
+    assert not listing_failed_outright({})
+    assert listing_failed_outright({"a": ServerListFault(tag="upstream_error", status_code=429)})
+    assert listing_failed_outright(
+        {"a": ServerListFault(tag="timeout"), "b": ServerListFault(tag="rate_limited", status_code=429)}
+    )
+    assert not listing_failed_outright(
+        {"a": ServerListFault(tag="upstream_error", status_code=500), "b": ServerListOk(tool_count=2)}
+    )
+    assert not listing_failed_outright({"a": ServerListFault(tag="auth_required", status_code=401)})
+    assert not listing_failed_outright({"a": ServerListFault(tag="forbidden", status_code=403)})
