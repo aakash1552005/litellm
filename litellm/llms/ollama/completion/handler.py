@@ -7,7 +7,6 @@ Ollama /chat/completion calls handled in llm_http_handler.py
 from collections.abc import Mapping, Sequence
 from typing import Any, Final, Protocol, TypedDict
 
-from pydantic import ConfigDict, TypeAdapter, with_config
 from typing_extensions import NotRequired, ReadOnly
 
 import litellm
@@ -25,17 +24,6 @@ class OllamaEmbeddingResponse(TypedDict):
 
     embeddings: ReadOnly[list[list[float]]]
     prompt_eval_count: ReadOnly[NotRequired[int]]
-
-
-@with_config(ConfigDict(extra="allow", strict=True))
-class _OllamaEmbeddingResponse(TypedDict):
-    """Body of an Ollama ``/api/embed`` response."""
-
-    embeddings: ReadOnly[Sequence[Sequence[int | float]]]
-    prompt_eval_count: ReadOnly[NotRequired[int]]
-
-
-_OLLAMA_EMBEDDING_RESPONSE: Final = TypeAdapter(_OllamaEmbeddingResponse)
 
 
 def _ollama_embed_url(api_base: str) -> str:
@@ -62,7 +50,7 @@ def _prepare_ollama_embedding_payload(
 
 
 def _process_ollama_embedding_response(
-    response_json: _OllamaEmbeddingResponse,
+    response_json: OllamaEmbeddingResponse,
     prompts: list[str],
     model: str,
     model_response: EmbeddingResponse,
@@ -70,7 +58,7 @@ def _process_ollama_embedding_response(
     encoding: TokenEncoder | None,
 ) -> EmbeddingResponse:
     output_data: Final = []
-    embeddings: Final = response_json["embeddings"]
+    embeddings: Final[list[list[float]]] = response_json["embeddings"]
 
     for idx, emb in enumerate(embeddings):
         output_data.append({"object": "embedding", "index": idx, "embedding": emb})
@@ -112,7 +100,7 @@ async def ollama_aembeddings(
     data: Final = _prepare_ollama_embedding_payload(model, prompts, optional_params)
 
     response: Final = await litellm.module_level_aclient.post(url=_ollama_embed_url(api_base), json=data)
-    response_json: Final = _OLLAMA_EMBEDDING_RESPONSE.validate_python(response.json(), strict=True)
+    response_json: Final[OllamaEmbeddingResponse] = response.json()
 
     return _process_ollama_embedding_response(
         response_json=response_json,
@@ -136,7 +124,7 @@ def ollama_embeddings(
     data: Final = _prepare_ollama_embedding_payload(model, prompts, optional_params)
 
     response: Final = litellm.module_level_client.post(url=_ollama_embed_url(api_base), json=data)
-    response_json: Final = _OLLAMA_EMBEDDING_RESPONSE.validate_python(response.json(), strict=True)
+    response_json: Final[OllamaEmbeddingResponse] = response.json()
 
     return _process_ollama_embedding_response(
         response_json=response_json,
