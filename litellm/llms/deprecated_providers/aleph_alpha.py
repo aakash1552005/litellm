@@ -1,17 +1,36 @@
 import json
 import time
 import types
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Final
 
 import httpx
+from pydantic import ConfigDict, JsonValue, TypeAdapter, with_config
+from typing_extensions import ReadOnly, TypedDict
 
 import litellm
 from litellm.utils import Choices, Message, ModelResponse, Usage
 
 
+@with_config(ConfigDict(extra="allow", strict=True))
+class _AlephAlphaCompletion(TypedDict):
+    completion: ReadOnly[str]
+    finish_reason: ReadOnly[str]
+
+
+@with_config(ConfigDict(extra="allow", strict=True))
+class _AlephAlphaCompletionResponse(TypedDict):
+    completions: ReadOnly[Sequence[_AlephAlphaCompletion]]
+
+
+_JSON_VALUE: Final[TypeAdapter[JsonValue]] = TypeAdapter(JsonValue)
+_ALEPH_ALPHA_COMPLETION_RESPONSE: Final[TypeAdapter[_AlephAlphaCompletionResponse]] = TypeAdapter(
+    _AlephAlphaCompletionResponse
+)
+
+
 class AlephAlphaError(Exception):
-    def __init__(self, status_code, message):
+    def __init__(self, status_code: int, message: object) -> None:
         self.status_code = status_code
         self.message = message
         self.request = httpx.Request(method="POST", url="https://api.aleph-alpha.com/complete")
@@ -249,30 +268,31 @@ def completion(
         )
         print_verbose(f"raw model_response: {response.text}")
         ## RESPONSE OBJECT
-        completion_response: Final = response.json()
-        if "error" in completion_response:
+        completion_json: Final[JsonValue] = _JSON_VALUE.validate_python(response.json(), strict=True)
+        if not isinstance(completion_json, dict):
+            raise AlephAlphaError(message=json.dumps(completion_json), status_code=response.status_code)
+        if "error" in completion_json:
             raise AlephAlphaError(
-                message=completion_response["error"],
+                message=completion_json["error"],
                 status_code=response.status_code,
             )
         else:
             try:
-                choices_list: Final = []
-                for idx, item in enumerate(completion_response["completions"]):
-                    if len(item["completion"]) > 0:
-                        message_obj = Message(content=item["completion"])
-                    else:
-                        message_obj = Message(content=None)
-                    choice_obj = Choices(
+                completion_response: Final[_AlephAlphaCompletionResponse] = (
+                    _ALEPH_ALPHA_COMPLETION_RESPONSE.validate_python(completion_json, strict=True)
+                )
+                choices_list: Final = [
+                    Choices(
                         finish_reason=item["finish_reason"],
                         index=idx + 1,
-                        message=message_obj,
+                        message=Message(content=item["completion"] or None),
                     )
-                    choices_list.append(choice_obj)
+                    for idx, item in enumerate(completion_response["completions"])
+                ]
                 model_response.choices = choices_list
             except Exception:
                 raise AlephAlphaError(
-                    message=json.dumps(completion_response),
+                    message=json.dumps(completion_json),
                     status_code=response.status_code,
                 )
 

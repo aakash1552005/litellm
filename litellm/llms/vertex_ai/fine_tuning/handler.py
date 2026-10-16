@@ -5,7 +5,8 @@ from datetime import datetime
 from typing import Final, Literal
 
 import httpx
-from pydantic import TypeAdapter
+from pydantic import ConfigDict, JsonValue, TypeAdapter, with_config
+from typing_extensions import ReadOnly, Required, TypedDict
 
 import litellm
 from litellm._logging import verbose_logger
@@ -19,12 +20,41 @@ from litellm.types.llms.vertex_ai import (
     FineTuneHyperparameters,
     FineTuneJobCreate,
     FineTunesupervisedTuningSpec,
-    ResponseSupervisedTuningSpec,
-    ResponseTuningJob,
 )
 from litellm.types.utils import LiteLLMFineTuningJob
 
-_JSON_VALUE: Final = TypeAdapter(object)
+
+@with_config(ConfigDict(extra="allow", strict=True))
+class _VertexFineTuningResponseHyperparameters(TypedDict, total=False):
+    epoch_count: ReadOnly[int | Literal["auto"] | None]
+    learning_rate_multiplier: ReadOnly[int | float | Literal["auto"] | None]
+    adapter_size: ReadOnly[JsonValue]
+
+
+@with_config(ConfigDict(extra="allow", strict=True))
+class _VertexFineTuningResponseSpec(TypedDict, total=False):
+    trainingDatasetUri: ReadOnly[str | None]
+    hyperParameters: ReadOnly[_VertexFineTuningResponseHyperparameters | None]
+
+
+@with_config(ConfigDict(extra="allow", strict=True))
+class _VertexFineTuningResponse(TypedDict, total=False):
+    name: ReadOnly[str | None]
+    tunedModelDisplayName: ReadOnly[str | None]
+    baseModel: ReadOnly[str | None]
+    supervisedTuningSpec: ReadOnly[_VertexFineTuningResponseSpec | None]
+    state: ReadOnly[Required[str | None]]
+    createTime: ReadOnly[str | None]
+
+
+_JSON_VALUE: Final[TypeAdapter[JsonValue]] = TypeAdapter(JsonValue)
+_VERTEX_FINE_TUNING_RESPONSE: Final[TypeAdapter[_VertexFineTuningResponse]] = TypeAdapter(_VertexFineTuningResponse)
+
+
+def _parse_vertex_fine_tuning_response(response_json: JsonValue) -> _VertexFineTuningResponse:
+    if not isinstance(response_json, dict):
+        raise TypeError(f"argument after ** must be a mapping, not {type(response_json).__name__}")
+    return _VERTEX_FINE_TUNING_RESPONSE.validate_python(response_json, strict=True)
 
 
 class VertexFineTuningAPI(VertexLLM):
@@ -39,7 +69,7 @@ class VertexFineTuningAPI(VertexLLM):
             params={"timeout": 600.0},
         )
 
-    def convert_response_created_at(self, response: ResponseTuningJob):
+    def convert_response_created_at(self, response: _VertexFineTuningResponse) -> int:
         try:
             create_time_str: Final = response.get("createTime", "") or ""
             create_time_datetime: Final = datetime.fromisoformat(create_time_str.replace("Z", "+00:00"))
@@ -108,7 +138,7 @@ class VertexFineTuningAPI(VertexLLM):
 
         return _vertex_hyperparameters
 
-    def convert_vertex_response_to_open_ai_response(self, response: ResponseTuningJob) -> LiteLLMFineTuningJob:
+    def convert_vertex_response_to_open_ai_response(self, response: _VertexFineTuningResponse) -> LiteLLMFineTuningJob:
         status: Literal["validating_files", "queued", "running", "succeeded", "failed", "cancelled"] = "queued"
         if response["state"] == "JOB_STATE_PENDING":
             status = "queued"
@@ -123,7 +153,7 @@ class VertexFineTuningAPI(VertexLLM):
 
         created_at: Final = self.convert_response_created_at(response)
 
-        _supervisedTuningSpec: Final[ResponseSupervisedTuningSpec] = response.get("supervisedTuningSpec", None) or {}
+        _supervisedTuningSpec: Final = response.get("supervisedTuningSpec", None) or _VertexFineTuningResponseSpec()
         training_uri: Final[str] = _supervisedTuningSpec.get("trainingDatasetUri", "") or ""
         return LiteLLMFineTuningJob(
             id=response.get("name", "") or "",
@@ -131,7 +161,10 @@ class VertexFineTuningAPI(VertexLLM):
             fine_tuned_model=response.get("tunedModelDisplayName", ""),
             finished_at=None,
             hyperparameters=self._translate_vertex_response_hyperparameters(
-                vertex_hyper_parameters=_supervisedTuningSpec.get("hyperParameters", FineTuneHyperparameters()) or {}
+                vertex_hyper_parameters=_supervisedTuningSpec.get(
+                    "hyperParameters", _VertexFineTuningResponseHyperparameters()
+                )
+                or _VertexFineTuningResponseHyperparameters()
             ),
             model=response.get("baseModel", "") or "",
             object="fine_tuning.job",
@@ -147,7 +180,7 @@ class VertexFineTuningAPI(VertexLLM):
         )
 
     def _translate_vertex_response_hyperparameters(
-        self, vertex_hyper_parameters: FineTuneHyperparameters
+        self, vertex_hyper_parameters: _VertexFineTuningResponseHyperparameters
     ) -> OpenAIFineTuningHyperparameters:
         """
         translate vertex responsehyperparameters to openai hyperparameters
@@ -183,13 +216,10 @@ class VertexFineTuningAPI(VertexLLM):
                     f"Error creating fine tuning job. Status code: {response.status_code}. Response: {response.text}"
                 )
 
-            verbose_logger.debug(
-                "got response from creating fine tuning job: %s", _JSON_VALUE.validate_python(response.json())
-            )
+            response_json: Final[JsonValue] = _JSON_VALUE.validate_python(response.json(), strict=True)
+            verbose_logger.debug("got response from creating fine tuning job: %s", response_json)
 
-            vertex_response: Final = ResponseTuningJob(
-                **response.json(),
-            )
+            vertex_response: Final = _parse_vertex_fine_tuning_response(response_json)
 
             verbose_logger.debug("vertex_response %s", vertex_response)
             open_ai_response: Final = self.convert_vertex_response_to_open_ai_response(vertex_response)
@@ -269,12 +299,9 @@ class VertexFineTuningAPI(VertexLLM):
                 f"Error creating fine tuning job. Status code: {response.status_code}. Response: {response.text}"
             )
 
-        verbose_logger.debug(
-            "got response from creating fine tuning job: %s", _JSON_VALUE.validate_python(response.json())
-        )
-        vertex_response: Final = ResponseTuningJob(
-            **response.json(),
-        )
+        response_json: Final[JsonValue] = _JSON_VALUE.validate_python(response.json(), strict=True)
+        verbose_logger.debug("got response from creating fine tuning job: %s", response_json)
+        vertex_response: Final = _parse_vertex_fine_tuning_response(response_json)
 
         verbose_logger.debug("vertex_response %s", vertex_response)
         open_ai_response: Final = self.convert_vertex_response_to_open_ai_response(vertex_response)
@@ -348,4 +375,4 @@ class VertexFineTuningAPI(VertexLLM):
                 f"Error creating fine tuning job. Status code: {response.status_code}. Response: {response.text}"
             )
 
-        return _JSON_VALUE.validate_python(response.json())
+        return _JSON_VALUE.validate_python(response.json(), strict=True)
