@@ -6,8 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
-from pydantic import ConfigDict, TypeAdapter, with_config
-from typing_extensions import ReadOnly, Required, TypedDict
+from typing_extensions import ReadOnly, TypedDict
 
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.openai.common_utils import OpenAIError
@@ -26,58 +25,16 @@ else:
     LiteLLMLoggingObj = Any
 
 
-@with_config(ConfigDict(extra="allow", strict=True))
-class _CompactifAIMessage(TypedDict, total=False):
-    content: ReadOnly[object]
-    tool_calls: ReadOnly[Sequence[object] | None]
+class CompactifAIResponseFields(TypedDict, total=False):
+    """The chat completion fields of a CompactifAI response body."""
 
-
-@with_config(ConfigDict(extra="allow", strict=True))
-class _CompactifAIChoice(TypedDict, total=False):
-    message: ReadOnly[_CompactifAIMessage | None]
-
-
-@with_config(ConfigDict(extra="allow", strict=True))
-class _CompactifAIResponseFields(TypedDict, total=False):
-    choices: Required[ReadOnly[Sequence[_CompactifAIChoice]]]
-
-
-@with_config(ConfigDict(extra="allow", strict=True))
-class _CompactifAIBody(TypedDict, total=False):
-    pass
-
-
-@with_config(ConfigDict(extra="allow", strict=True))
-class _CompactifAIFunction(TypedDict, total=False):
-    arguments: ReadOnly[object]
-
-
-@with_config(ConfigDict(extra="allow", strict=True))
-class _CompactifAIToolCall(TypedDict):
-    function: ReadOnly[_CompactifAIFunction]
-
-
-_COMPACTIFAI_RESPONSE: Final = TypeAdapter(_CompactifAIResponseFields)
-_COMPACTIFAI_BODY: Final = TypeAdapter(_CompactifAIBody)
-_TOOL_CALL: Final = TypeAdapter(_CompactifAIToolCall)
-
-
-def _json_mode_response(response_body: object) -> ModelResponse:
-    response_fields: Final = _COMPACTIFAI_RESPONSE.validate_python(response_body)
-    choices: Final = [
-        {
-            **choice,
-            "message": {
-                **message,
-                "content": _TOOL_CALL.validate_python(tool_calls[0])["function"].get("arguments", ""),
-                "tool_calls": None,
-            },
-        }
-        if (message := choice.get("message")) and (tool_calls := message.get("tool_calls")) and len(tool_calls) == 1
-        else choice
-        for choice in response_fields["choices"]
-    ]
-    return ModelResponse(**{**response_fields, "choices": choices})
+    id: ReadOnly[str]
+    choices: ReadOnly[Sequence[Mapping[str, object]]]
+    created: ReadOnly[int]
+    model: ReadOnly[str]
+    system_fingerprint: ReadOnly[str | None]
+    usage: ReadOnly[Mapping[str, object]]
+    object: ReadOnly[str]
 
 
 class CompactifAIChatConfig(OpenAIGPTConfig):
@@ -125,13 +82,22 @@ class CompactifAIChatConfig(OpenAIGPTConfig):
         )
 
         ## RESPONSE OBJECT
+        response_json: Final = raw_response.json()
+
         # Handle JSON mode if needed
-        # Convert tool calls to content for JSON mode
-        returned_response: Final = (
-            _json_mode_response(raw_response.json())
-            if json_mode
-            else ModelResponse(**_COMPACTIFAI_BODY.validate_python(raw_response.json()))
-        )
+        if json_mode:
+            for choice in response_json["choices"]:
+                message = choice.get("message")
+                if message and message.get("tool_calls"):
+                    # Convert tool calls to content for JSON mode
+                    tool_calls = message.get("tool_calls", [])
+                    if len(tool_calls) == 1:
+                        message["content"] = tool_calls[0]["function"].get("arguments", "")
+                        message["tool_calls"] = None
+
+        response_fields: Final[CompactifAIResponseFields] = response_json
+
+        returned_response: Final = ModelResponse(**response_fields)
 
         # Set model name with provider prefix
         returned_response.model = f"compactifai/{model}"
