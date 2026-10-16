@@ -674,8 +674,8 @@ async def _post_call_rewritten_texts(
     groups: _StreamTextGroups,
     proxy_logging_obj: "ProxyLogging",
     user_api_key_dict: "UserAPIKeyAuth",
-    data: dict[str, object],
-) -> list[str] | None:
+    data: dict[str, object],  # mutable-ok: the request dict post_call hooks receive
+) -> Sequence[str] | None:
     """Run the post_call guardrails on a buffered stream's texts as one Converse response with a content block per
     group, and return each group's text as the guardrails left it, or None when the response came back in another
     shape."""
@@ -713,7 +713,7 @@ async def _guardrail_buffered_invoke_stream(
     body_bytes: bytes,
     proxy_logging_obj: "ProxyLogging",
     user_api_key_dict: "UserAPIKeyAuth",
-    data: dict[str, object],
+    data: dict[str, object],  # mutable-ok: the request dict post_call hooks receive
 ) -> bytes:
     """Scan a whole Claude invoke stream the way the buffered Converse path scans its stream, and write the guardrail
     rewrites back into the ``chunk`` frames that carried each text."""
@@ -769,7 +769,7 @@ class BedrockPassthroughGuardrailHandler(BaseTranslation):
         body_bytes: bytes,
         proxy_logging_obj: "ProxyLogging",
         user_api_key_dict: "UserAPIKeyAuth",
-        data: dict[str, object],
+        data: dict[str, object],  # mutable-ok: the request dict post_call hooks receive
     ) -> bytes:
         if _is_invoke_stream_endpoint(str(data.get("endpoint") or "")):
             return await _guardrail_buffered_invoke_stream(body_bytes, proxy_logging_obj, user_api_key_dict, data)
