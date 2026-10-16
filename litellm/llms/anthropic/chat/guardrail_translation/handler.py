@@ -20,7 +20,7 @@ from itertools import chain, repeat
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Protocol, cast, overload, runtime_checkable
 
-from pydantic import ConfigDict, TypeAdapter, ValidationError, with_config
+from pydantic import TypeAdapter, ValidationError
 from typing_extensions import ReadOnly, TypedDict, assert_never
 
 from litellm._logging import verbose_proxy_logger
@@ -287,24 +287,14 @@ def _tool_call_shapes(tool_calls: Sequence[object]) -> tuple[_ToolCallShape, ...
     )
 
 
-@with_config(ConfigDict(extra="allow", strict=True))
 class _AnthropicSSEDelta(TypedDict, total=False):
-    type: ReadOnly[object]
+    type: ReadOnly[str]
     text: ReadOnly[str]
-    stop_reason: ReadOnly[object]
+    stop_reason: ReadOnly[str | None]
 
 
-@with_config(ConfigDict(extra="allow", strict=True))
 class _AnthropicSSEEvent(TypedDict, total=False):
     delta: ReadOnly[_AnthropicSSEDelta]
-
-
-_ANTHROPIC_SSE_EVENT_ADAPTER: Final = TypeAdapter(_AnthropicSSEEvent)
-_EMPTY_ANTHROPIC_SSE_DELTA: Final[_AnthropicSSEDelta] = {}
-
-
-def _parse_anthropic_sse_event(data_line: str) -> _AnthropicSSEEvent:
-    return _ANTHROPIC_SSE_EVENT_ADAPTER.validate_python(json.loads(data_line))
 
 
 class AnthropicMessagesHandler(BaseTranslation):
@@ -1680,8 +1670,8 @@ class AnthropicMessagesHandler(BaseTranslation):
                 # Only process content_block_delta events
                 if event_type == "content_block_delta" and data_line:
                     try:
-                        data = _parse_anthropic_sse_event(data_line)
-                        delta = data.get("delta", _EMPTY_ANTHROPIC_SSE_DELTA)
+                        data: _AnthropicSSEEvent = json.loads(data_line)
+                        delta: _AnthropicSSEDelta = data.get("delta", {})
                         if delta.get("type") == "text_delta":
                             text += delta.get("text", "")
                     except json.JSONDecodeError:
@@ -1743,9 +1733,9 @@ class AnthropicMessagesHandler(BaseTranslation):
                         # Check for message_delta event with stop_reason
                         if event_type == "message_delta" and data_line:
                             try:
-                                data = _parse_anthropic_sse_event(data_line)
-                                delta = data.get("delta", _EMPTY_ANTHROPIC_SSE_DELTA)
-                                stop_reason: object | None = delta.get("stop_reason")
+                                data: _AnthropicSSEEvent = json.loads(data_line)
+                                delta: _AnthropicSSEDelta = data.get("delta", {})
+                                stop_reason: str | None = delta.get("stop_reason")
                                 if stop_reason is not None:
                                     return True
                             except json.JSONDecodeError:

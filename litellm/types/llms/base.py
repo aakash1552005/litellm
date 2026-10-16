@@ -1,6 +1,6 @@
 import threading
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from openai._models import BaseModel as OpenAIObject
 from pydantic import BaseModel, ConfigDict
@@ -84,7 +84,7 @@ class BaseLiteLLMOpenAIResponseObject(LiteLLMBaseModel):
 
 
 class HiddenParams(OpenAIObject):
-    original_response: object | None = None
+    original_response: str | Any | None = None
     model_id: str | None = None  # used in Router for individual deployments
     api_base: str | None = None  # returns api base used for making completion call
     _response_ms: float | None = None
