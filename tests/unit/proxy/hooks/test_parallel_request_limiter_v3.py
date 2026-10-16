@@ -3939,6 +3939,35 @@ async def test_mcp_per_team_rate_limit_is_enforced_from_team_metadata_v3() -> No
 
 
 @pytest.mark.asyncio
+async def test_inherited_mcp_team_rate_limit_deduplicates_team_and_source_descriptors_v3() -> None:
+    handler, _ = _make_mcp_handler()
+    server: Final = MCPServer(
+        server_id="math-a",
+        name="math_a",
+        server_name="math_a",
+        transport=MCPTransport.http,
+    )
+    inherited_auth: Final = UserAPIKeyAuth(
+        api_key=hash_token("sk-inherited"),
+        team_id="team-a",
+        team_metadata={"mcp_rpm_limit": {"math_a": 1}},
+    ).model_copy(update={"mcp_source_team_rpm_limits": {"team-a": {"math_a": 1}}})
+    descriptors: Final[list[RateLimitDescriptor]] = []
+    handler._add_mcp_per_key_rate_limit_descriptor(inherited_auth, "math_a", descriptors)
+
+    assert descriptors == []
+    team_descriptors: Final[list[RateLimitDescriptor]] = []
+    handler._add_mcp_per_team_rate_limit_descriptor(inherited_auth, "math_a", team_descriptors)
+    assert [(descriptor["key"], descriptor["value"]) for descriptor in team_descriptors] == [
+        ("mcp_per_team", "team-a:math_a")
+    ]
+    await handler.enforce_mcp_server_rate_limits(inherited_auth, server)
+
+    with pytest.raises(ProxyRateLimitError, match="mcp_per_team"):
+        await handler.enforce_mcp_server_rate_limits(inherited_auth, server)
+
+
+@pytest.mark.asyncio
 async def test_mcp_server_rpm_is_shared_across_keys_v3() -> None:
     handler, _ = _make_mcp_handler()
     server: Final = MCPServer(

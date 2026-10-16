@@ -1331,9 +1331,12 @@ async def test_get_tools_from_mcp_servers_continues_when_one_server_fails():
         "litellm.proxy._experimental.mcp_server.operations.global_mcp_server_manager",
         mock_manager,
     ):
-        with patch(
-            "litellm.proxy._experimental.mcp_server.catalog.verbose_logger",
-        ) as mock_logger, patch("litellm.proxy._experimental.mcp_server.operations.verbose_logger", mock_logger):
+        with (
+            patch(
+                "litellm.proxy._experimental.mcp_server.catalog.verbose_logger",
+            ) as mock_logger,
+            patch("litellm.proxy._experimental.mcp_server.operations.verbose_logger", mock_logger),
+        ):
             # Test with server-specific auth headers
             mcp_server_auth_headers = {
                 "working": {"Authorization": "Bearer working-token"},
@@ -1427,9 +1430,12 @@ async def test_get_tools_from_mcp_servers_handles_all_servers_failing():
         "litellm.proxy._experimental.mcp_server.operations.global_mcp_server_manager",
         mock_manager,
     ):
-        with patch(
-            "litellm.proxy._experimental.mcp_server.catalog.verbose_logger",
-        ) as mock_logger, patch("litellm.proxy._experimental.mcp_server.operations.verbose_logger", mock_logger):
+        with (
+            patch(
+                "litellm.proxy._experimental.mcp_server.catalog.verbose_logger",
+            ) as mock_logger,
+            patch("litellm.proxy._experimental.mcp_server.operations.verbose_logger", mock_logger),
+        ):
             # Test with server-specific auth headers
             mcp_server_auth_headers = {
                 "failing1": {"Authorization": "Bearer failing1-token"},
@@ -3531,8 +3537,15 @@ async def test_initialize_request_with_existing_session_tracks_new_session():
             patch(  # test-quality-ok: registry is empty in unit tests; key owns one server
                 "litellm.proxy._experimental.mcp_server.operations._get_allowed_mcp_servers",
                 new_callable=AsyncMock,
-                return_value=[MCPServer(server_id="new-server", name="new-server", url="http://upstream/mcp",
-                                        transport=MCPTransport.http, auth_type=MCPAuth.none)],
+                return_value=[
+                    MCPServer(
+                        server_id="new-server",
+                        name="new-server",
+                        url="http://upstream/mcp",
+                        transport=MCPTransport.http,
+                        auth_type=MCPAuth.none,
+                    )
+                ],
             ),
             patch(
                 "litellm.proxy._experimental.mcp_server.server._SESSION_MANAGERS_INITIALIZED",
@@ -3756,10 +3769,13 @@ async def test_owner_fingerprint_hashes_custom_api_keys():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("body", [
-    b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
-    b'{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":0}}',
-])
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+        b'{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":0}}',
+    ],
+)
 async def test_stateful_mcp_session_owner_mismatch_returns_403(body: bytes):
     """
     A stateful mcp-session-id is bound to its creator. A different
@@ -7254,9 +7270,9 @@ async def test_oauth_passthrough_preflight_preserves_status_contract(probe_statu
                 user_api_key_auth=UserAPIKeyAuth(user_id="admitted-user"),
                 mcp_servers=["passthrough_server"],
                 client_ip=None,
-            oauth2_headers={"Authorization": "Bearer upstream-token"},
-            mcp_server_auth_headers=None,
-            raw_headers={"x-litellm-api-key": "sk-litellm-proxy-key", "Authorization": "Bearer upstream-token"},
+                oauth2_headers={"Authorization": "Bearer upstream-token"},
+                mcp_server_auth_headers=None,
+                raw_headers={"x-litellm-api-key": "sk-litellm-proxy-key", "Authorization": "Bearer upstream-token"},
             )
             assert result is None
         else:
@@ -7266,9 +7282,9 @@ async def test_oauth_passthrough_preflight_preserves_status_contract(probe_statu
                     user_api_key_auth=UserAPIKeyAuth(user_id="admitted-user"),
                     mcp_servers=["passthrough_server"],
                     client_ip=None,
-            oauth2_headers={"Authorization": "Bearer upstream-token"},
-            mcp_server_auth_headers=None,
-            raw_headers={"x-litellm-api-key": "sk-litellm-proxy-key", "Authorization": "Bearer upstream-token"},
+                    oauth2_headers={"Authorization": "Bearer upstream-token"},
+                    mcp_server_auth_headers=None,
+                    raw_headers={"x-litellm-api-key": "sk-litellm-proxy-key", "Authorization": "Bearer upstream-token"},
                 )
             assert exc_info.value.status_code == expected_status
             if expected_status == 401:
@@ -10511,6 +10527,7 @@ async def test_post_mcp_call_guardrails_return_the_rewritten_result():
     logging_obj = _mock_mcp_logging_obj()
     raw_result = _call_tool_result(False, "jane@example.com")
     masked_result = _call_tool_result(False, "<EMAIL_ADDRESS>")
+    auth: Final = UserAPIKeyAuth(api_key="test-key", user_id="test-user")
     proxy_logging_mock = _mock_mcp_proxy_logging()
     proxy_logging_mock.post_mcp_call_hook = AsyncMock(return_value=masked_result)
 
@@ -10518,7 +10535,8 @@ async def test_post_mcp_call_guardrails_return_the_rewritten_result():
         returned = await _run_post_mcp_call_guardrails(
             result=raw_result,
             litellm_logging_obj=logging_obj,
-            user_api_key_auth=UserAPIKeyAuth(api_key="test-key", user_id="test-user"),
+            original_auth=auth,
+            guardrail_auth=auth,
             request_data={},
         )
 
@@ -10542,6 +10560,7 @@ async def test_post_mcp_call_guardrails_run_without_a_logging_object():
 
     raw_result = _call_tool_result(False, "jane@example.com")
     masked_result = _call_tool_result(False, "<EMAIL_ADDRESS>")
+    auth: Final = UserAPIKeyAuth(api_key="test-key", user_id="test-user")
     proxy_logging_mock = _mock_mcp_proxy_logging()
     proxy_logging_mock.post_mcp_call_hook = AsyncMock(return_value=masked_result)
 
@@ -10549,7 +10568,8 @@ async def test_post_mcp_call_guardrails_run_without_a_logging_object():
         returned = await _run_post_mcp_call_guardrails(
             result=raw_result,
             litellm_logging_obj=None,
-            user_api_key_auth=UserAPIKeyAuth(api_key="test-key", user_id="test-user"),
+            original_auth=auth,
+            guardrail_auth=auth,
             request_data={"name": "fetch_record"},
         )
 
@@ -10576,7 +10596,8 @@ async def test_post_mcp_call_guardrails_propagate_a_block():
             await _run_post_mcp_call_guardrails(
                 result=_call_tool_result(False, "jane@example.com"),
                 litellm_logging_obj=_mock_mcp_logging_obj(),
-                user_api_key_auth=None,
+                original_auth=None,
+                guardrail_auth=None,
                 request_data={},
             )
 
@@ -11637,8 +11658,7 @@ async def test_passthrough_probes_bind_each_token_to_its_authorized_server(allow
         )
     assert result is None
     assert tuple(
-        (str(call.request.url), call.request.headers["Authorization"])
-        for call in (*first.calls, *second.calls)
+        (str(call.request.url), call.request.headers["Authorization"]) for call in (*first.calls, *second.calls)
     ) == (
         (("http://first/mcp", "Bearer first-token"), ("http://second/mcp", "Bearer second-token"))
         if allowed and header_shape != "non_authorization"
@@ -11699,6 +11719,7 @@ async def test_streamable_http_admission_auth_sees_only_peeked_jsonrpc_method() 
     assert downstream_bodies == [_INITIALIZE]
     stateless_handle.assert_not_awaited()
     send.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -11792,16 +11813,22 @@ async def test_progress_text_obeys_request_output_guardrails(monkeypatch, action
     from litellm.types.guardrails import BlockedWord, ContentFilterAction, GuardrailEventHooks
 
     policy = ContentFilterGuardrail(
-        guardrail_name="progress-policy", event_hook=GuardrailEventHooks.post_mcp_call,
+        guardrail_name="progress-policy",
+        event_hook=GuardrailEventHooks.post_mcp_call,
         blocked_words=[BlockedWord(keyword="halfway", action=ContentFilterAction(action))],
-        keyword_redaction_tag="[masked]", default_on=False,
+        keyword_redaction_tag="[masked]",
+        default_on=False,
     )
     monkeypatch.setattr(litellm, "callbacks", [policy])
     monkeypatch.setattr(proxy_server, "proxy_logging_obj", ProxyLogging(user_api_key_cache=DualCache()))
     delivered = AsyncMock()
     caller = UserAPIKeyAuth(user_id="progress-user")
     callback = _guarded_progress_callback(
-        delivered, None, caller, {"metadata": {"guardrails": ["progress-policy"] if selected else []}}
+        delivered,
+        None,
+        caller,
+        caller,
+        {"metadata": {"guardrails": ["progress-policy"] if selected else []}},
     )
     assert callback is not None
     await callback(0, None, message)
@@ -11815,8 +11842,8 @@ async def test_progress_callback_preserves_absence_and_cancellation():
 
     from litellm.proxy._experimental.mcp_server.operations import _guarded_progress_callback
 
-    assert _guarded_progress_callback(None, None, None, {}) is None
-    callback = _guarded_progress_callback(AsyncMock(side_effect=asyncio.CancelledError), None, None, {})
+    assert _guarded_progress_callback(None, None, None, None, {}) is None
+    callback = _guarded_progress_callback(AsyncMock(side_effect=asyncio.CancelledError), None, None, None, {})
     assert callback is not None
     with pytest.raises(asyncio.CancelledError):
         await callback(0, 0, None)
