@@ -3,49 +3,25 @@ JSON-based provider configuration loader for OpenAI-compatible providers.
 """
 
 import json
-from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Final
 
-from pydantic import ConfigDict, TypeAdapter, with_config
-from typing_extensions import NotRequired, ReadOnly, Required, TypedDict
-
 from litellm._logging import verbose_logger
-
-
-@with_config(ConfigDict(strict=True))
-class _SimpleProviderConfigData(TypedDict, total=False, extra_items=object):
-    base_url: ReadOnly[Required[str]]
-    api_key_env: ReadOnly[Required[str]]
-    api_base_env: ReadOnly[NotRequired[str | None]]
-    base_class: ReadOnly[NotRequired[str | None]]
-    param_mappings: ReadOnly[NotRequired[Mapping[str, str]]]
-    constraints: ReadOnly[NotRequired[Mapping[str, int | float | bool]]]
-    special_handling: ReadOnly[NotRequired[Mapping[str, bool]]]
-    supported_endpoints: ReadOnly[NotRequired[Sequence[str]]]
-
-
-_PROVIDERS_ADAPTER: Final = TypeAdapter(
-    dict[str, _SimpleProviderConfigData],
-    config=ConfigDict(strict=True),
-)
-_SIMPLE_PROVIDER_CONFIG_ADAPTER: Final = TypeAdapter(_SimpleProviderConfigData)
 
 
 class SimpleProviderConfig:
     """Simple data class for JSON provider config"""
 
-    def __init__(self, slug: str, data: Mapping[str, object]):
-        validated_data: Final = _SIMPLE_PROVIDER_CONFIG_ADAPTER.validate_python(dict(data))
-        self.slug: Final = slug
-        self.base_url: Final = validated_data["base_url"]
-        self.api_key_env: Final = validated_data["api_key_env"]
-        self.api_base_env: Final = validated_data.get("api_base_env")
-        self.base_class: Final = validated_data.get("base_class", "openai_gpt")
-        self.param_mappings: Final = validated_data.get("param_mappings", {})
-        self.constraints: Final = validated_data.get("constraints", {})
-        self.special_handling: Final = validated_data.get("special_handling", {})
-        self.supported_endpoints: Final = validated_data.get("supported_endpoints", [])
+    def __init__(self, slug: str, data: dict):
+        self.slug = slug
+        self.base_url = data["base_url"]
+        self.api_key_env = data["api_key_env"]
+        self.api_base_env = data.get("api_base_env")
+        self.base_class = data.get("base_class", "openai_gpt")
+        self.param_mappings = data.get("param_mappings", {})
+        self.constraints = data.get("constraints", {})
+        self.special_handling = data.get("special_handling", {})
+        self.supported_endpoints = data.get("supported_endpoints", [])
 
 
 class JSONProviderRegistry:
@@ -69,7 +45,7 @@ class JSONProviderRegistry:
 
         try:
             with open(json_path) as f:
-                data: Final = _PROVIDERS_ADAPTER.validate_python(json.load(f))
+                data: Final = json.load(f)
 
             for slug, config in data.items():
                 cls._providers[slug] = SimpleProviderConfig(slug, config)
@@ -103,7 +79,7 @@ class JSONProviderRegistry:
         return "/v1/responses" in provider.supported_endpoints
 
     @classmethod
-    def list_providers(cls) -> Sequence[str]:
+    def list_providers(cls) -> list:
         """List all registered provider slugs"""
         return list(cls._providers.keys())
 
