@@ -7,9 +7,11 @@ https://docs.twelvelabs.io/docs/models/pegasus
 
 import json
 import time
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, NotRequired, TypedDict
 
 import httpx
+from pydantic import BaseModel, ConfigDict, TypeAdapter, with_config
+from typing_extensions import ReadOnly
 
 import litellm
 from litellm._logging import verbose_logger
@@ -32,6 +34,15 @@ if TYPE_CHECKING:
     LiteLLMLoggingObj = _LiteLLMLoggingObj
 else:
     LiteLLMLoggingObj = Any
+
+
+@with_config(ConfigDict(extra="allow", strict=True))
+class _PegasusResponse(TypedDict, total=False):
+    message: ReadOnly[NotRequired[str | None]]
+    finishReason: ReadOnly[NotRequired[str]]
+
+
+_PEGASUS_RESPONSE: Final = TypeAdapter(_PegasusResponse)
 
 
 class AmazonTwelveLabsPegasusConfig(AmazonInvokeConfig, BaseConfig):
@@ -99,6 +110,10 @@ class AmazonTwelveLabsPegasusConfig(AmazonInvokeConfig, BaseConfig):
                 return value
             # Otherwise return the dict as is
             return value
+        if value is None:
+            return value
+        if not isinstance(value, type) or not issubclass(value, BaseModel):
+            raise TypeError(f"Unsupported response_format type - {value}")
         return type_to_response_format_param(response_format=value) or value
 
     def transform_request(
@@ -207,7 +222,7 @@ class AmazonTwelveLabsPegasusConfig(AmazonInvokeConfig, BaseConfig):
         ModelResponse with choices[0].message.content and finish_reason
         """
         try:
-            completion_response: Final = raw_response.json()
+            completion_response: Final = _PEGASUS_RESPONSE.validate_python(raw_response.json(), strict=True)
         except Exception as e:
             raise BedrockError(
                 message=f"Error parsing response: {raw_response.text}, error: {e}",
