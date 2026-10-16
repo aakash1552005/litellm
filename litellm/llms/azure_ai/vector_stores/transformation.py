@@ -4,6 +4,8 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
+from pydantic import ConfigDict, TypeAdapter, with_config
+from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 from litellm.llms.azure.common_utils import BaseAzureLLM
 from litellm.llms.base_llm.vector_store.transformation import (
@@ -28,6 +30,25 @@ if TYPE_CHECKING:
     LiteLLMLoggingObj = _LiteLLMLoggingObj
 else:
     LiteLLMLoggingObj = Any
+
+_AzureSearchDocument = with_config(ConfigDict(extra="allow", strict=True))(
+    TypedDict(
+        "_AzureSearchDocument",
+        {
+            "id": NotRequired[ReadOnly[str]],
+            "content": NotRequired[ReadOnly[str | None]],
+            "@search.score": NotRequired[ReadOnly[int | float]],
+        },
+    )
+)
+
+
+@with_config(ConfigDict(extra="allow", strict=True))
+class _AzureSearchResponse(TypedDict):
+    value: NotRequired[ReadOnly[Sequence[_AzureSearchDocument]]]
+
+
+_AZURE_SEARCH_RESPONSE: Final = TypeAdapter(_AzureSearchResponse)
 
 
 class AzureAIVectorStoreConfig(BaseQueryEmbeddingVectorStoreConfig, BaseAzureLLM):
@@ -198,7 +219,7 @@ class AzureAIVectorStoreConfig(BaseQueryEmbeddingVectorStoreConfig, BaseAzureLLM
         }
         """
         try:
-            response_json: Final = response.json()
+            response_json: Final = _AZURE_SEARCH_RESPONSE.validate_python(response.json())
 
             # Extract results from Azure AI Search API response
             results: Final = response_json.get("value", [])
@@ -228,10 +249,11 @@ class AzureAIVectorStoreConfig(BaseQueryEmbeddingVectorStoreConfig, BaseAzureLLM
 
                 # Build attributes with all available metadata
                 # Exclude system fields and already-processed fields
-                attributes = {}
-                for key, value in result.items():
-                    if key not in ["id", "content", "contentVector", "@search.score"]:
-                        attributes[key] = value
+                attributes = {
+                    key: value
+                    for key, value in result.items()
+                    if key not in ["id", "content", "contentVector", "@search.score"]
+                }
 
                 # Always include document_id in attributes
                 attributes["document_id"] = document_id
