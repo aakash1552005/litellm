@@ -90,7 +90,7 @@ class OpenAITextCompletionConfig(BaseTextCompletionConfig, OpenAIGPTConfig):
             if response_object is None or model_response_object is None:
                 raise ValueError("Error in response object format")
             choice_list: Final[list[Choices]] = []
-            for idx, choice in enumerate(response_object["choices"]):
+            for idx, choice in enumerate(response_object.choices):
                 message = Message(
                     content=choice["text"],
                     role="assistant",
@@ -99,7 +99,7 @@ class OpenAITextCompletionConfig(BaseTextCompletionConfig, OpenAIGPTConfig):
                     finish_reason=choice["finish_reason"],
                     index=idx,
                     message=message,
-                    logprobs=choice.get("logprobs", None),
+                    logprobs=getattr(choice, "logprobs", None),
                 )
                 choice_list.append(choice)
             model_response_object.choices = choice_list
