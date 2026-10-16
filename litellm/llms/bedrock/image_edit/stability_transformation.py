@@ -22,10 +22,13 @@ API Reference: https://docs.aws.amazon.com/bedrock/latest/userguide/model-parame
 """
 
 import base64
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Final, cast
 
 import httpx
 from httpx._types import RequestFiles
+from pydantic import ConfigDict, TypeAdapter, with_config
+from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 from litellm.llms.base_llm.image_edit.transformation import BaseImageEditConfig
 from litellm.llms.bedrock.common_utils import BedrockError
@@ -43,6 +46,16 @@ if TYPE_CHECKING:
     LiteLLMLoggingObj = _LiteLLMLoggingObj
 else:
     LiteLLMLoggingObj = Any
+
+
+@with_config(ConfigDict(extra="allow", strict=True))
+class _StabilityImageEditResponse(TypedDict):
+    errors: ReadOnly[NotRequired[object]]
+    finish_reasons: ReadOnly[NotRequired[Sequence[str | None]]]
+    images: ReadOnly[NotRequired[Sequence[str | None]]]
+
+
+_STABILITY_IMAGE_EDIT_RESPONSE_ADAPTER: Final = TypeAdapter(_StabilityImageEditResponse)
 
 
 class BedrockStabilityImageEditConfig(BaseImageEditConfig):
@@ -299,7 +312,10 @@ class BedrockStabilityImageEditConfig(BaseImageEditConfig):
         OpenAI expects: {"data": [{"b64_json": "base64..."}], "created": timestamp}
         """
         try:
-            response_data: Final = raw_response.json()
+            response_data: Final[_StabilityImageEditResponse] = _STABILITY_IMAGE_EDIT_RESPONSE_ADAPTER.validate_python(
+                raw_response.json(),
+                strict=True,
+            )
         except Exception as e:
             raise self.get_error_class(
                 error_message=f"Error parsing Bedrock Stability response: {e}",
