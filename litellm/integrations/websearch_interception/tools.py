@@ -7,9 +7,10 @@ to this format for consistent interception and execution.
 """
 
 from collections.abc import Mapping
-from typing import Any, Final
+from typing import Final
 
 from litellm.constants import LITELLM_WEB_SEARCH_TOOL_NAME
+from litellm.litellm_core_utils.core_helpers import as_str_mapping
 
 _WEB_SEARCH_TOOL_DESCRIPTION: Final = (
     "Search the web for information. Use this when you need current "
@@ -160,11 +161,19 @@ def is_web_search_tool_responses(tool: Mapping[str, object]) -> bool:
     return tool_type == "web_search" or tool_type.startswith("web_search_")
 
 
+def _function_name(function_def: object) -> object:
+    """Read ``name`` from an OpenAI ``function`` entry, failing like ``function_def.get`` on a non-mapping."""
+    mapping: Final = as_str_mapping(function_def)
+    if mapping is None:
+        raise AttributeError(f"'{type(function_def).__name__}' object has no attribute 'get'")
+    return mapping.get("name", "")
+
+
 def is_chat_completion_request_web_search_tool(tool: Mapping[str, object]) -> bool:
     return tool.get("type") == "web_search" or is_web_search_tool(dict(tool))
 
 
-def is_web_search_tool_chat_completion(tool: dict[str, Any]) -> bool:
+def is_web_search_tool_chat_completion(tool: Mapping[str, object]) -> bool:
     """
     Check if a tool is a web search tool for Chat Completions API (strict check).
 
@@ -196,8 +205,7 @@ def is_web_search_tool_chat_completion(tool: dict[str, Any]) -> bool:
 
     # Check for OpenAI format: {"type": "function", "function": {"name": "litellm_web_search"}}
     if tool_type == "function" and "function" in tool:
-        function_def: Final = tool.get("function", {})
-        function_name: Final = function_def.get("name", "")
+        function_name: Final = _function_name(tool.get("function", {}))
         if function_name == LITELLM_WEB_SEARCH_TOOL_NAME:
             return True
 
@@ -229,7 +237,7 @@ def is_anthropic_native_web_search_tool(tool: Mapping[str, object]) -> bool:
     return tool_type.startswith("web_search_") and tool_type != "function"
 
 
-def is_web_search_tool(tool: dict[str, Any]) -> bool:
+def is_web_search_tool(tool: Mapping[str, object]) -> bool:
     """
     Check if a tool is a web search tool (native or LiteLLM standard).
 
@@ -280,8 +288,7 @@ def is_web_search_tool(tool: dict[str, Any]) -> bool:
 
     # Check for OpenAI format: {"type": "function", "function": {"name": "..."}}
     if tool_type == "function" and "function" in tool:
-        function_def: Final = tool.get("function", {})
-        function_name: Final = function_def.get("name", "")
+        function_name: Final = _function_name(tool.get("function", {}))
         if function_name == LITELLM_WEB_SEARCH_TOOL_NAME:
             return True
 
@@ -290,6 +297,8 @@ def is_web_search_tool(tool: dict[str, Any]) -> bool:
         return True
 
     # Check for native Anthropic web_search_* types
+    if not isinstance(tool_type, str):
+        raise AttributeError(f"'{type(tool_type).__name__}' object has no attribute 'startswith'")
     if tool_type.startswith("web_search_"):
         return True
 

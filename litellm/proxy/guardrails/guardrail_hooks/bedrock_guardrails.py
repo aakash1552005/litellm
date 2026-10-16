@@ -16,7 +16,7 @@ import json
 import re
 import sys
 import time
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterable, Mapping, Sequence
 from datetime import datetime, timezone
 from itertools import accumulate, groupby
 from types import MappingProxyType
@@ -2909,7 +2909,7 @@ class BedrockGuardrail(CustomGuardrail, BaseAWSLLM):
     async def async_post_call_streaming_iterator_hook(
         self,
         user_api_key_dict: UserAPIKeyAuth,
-        response: Any,
+        response: AsyncIterable[ModelResponseStream],
         request_data: dict,
     ) -> AsyncGenerator[ModelResponseStream, None]:
         """
