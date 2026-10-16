@@ -985,12 +985,12 @@ class LangFuseLogger:
     @staticmethod
     def _get_chat_content_for_langfuse(
         response_obj: ModelResponse,
-    ) -> str | None:
+    ) -> dict[str, object] | None:
         """
         Get the chat content for Langfuse logging
         """
         if response_obj.choices and len(response_obj.choices) > 0:
-            output: Final = response_obj["choices"][0]["message"].json()
+            output: Final[dict[str, object]] = response_obj.choices[0].message.json()
             return output
         else:
             return None
@@ -1282,12 +1282,12 @@ def _end_grounding_span(*, tracing: "LangfuseTracing", parent: "LangfuseObservat
 
 
 def log_requester_metadata(clean_metadata: Mapping[str, Any]):
-    returned_metadata: Final = {}
+    returned_metadata: Final[dict[str, object]] = {}
     requester_metadata: Final = clean_metadata.get("requester_metadata") or {}
     for k, v in clean_metadata.items():
         if k not in requester_metadata:
             returned_metadata[k] = v
 
-    returned_metadata.update({"requester_metadata": requester_metadata})
+    returned_metadata["requester_metadata"] = requester_metadata
 
     return returned_metadata

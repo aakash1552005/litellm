@@ -15,8 +15,8 @@ from typing import Any, Final, NoReturn, Protocol, TypeVar, cast
 import anyio
 import httpx
 from openai.types.chat import ChatCompletionChunk
-from pydantic import BaseModel, ValidationError
-from typing_extensions import NotRequired, TypedDict
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, with_config
+from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 import litellm
 from litellm import verbose_logger
@@ -122,19 +122,35 @@ class _ProviderChunkEarlyReturn:
 _ProviderChunkResult = _ProviderChunkParsed | _ProviderChunkEarlyReturn
 
 
-class _PredibaseStreamData(TypedDict):
-    token: NotRequired[Mapping[str, str]]
-    details: Mapping[str, str]
-    generated_text: str | None
-    error: str | None
+@with_config(ConfigDict(extra="allow", strict=True))
+class _PredibaseToken(TypedDict, total=False):
+    text: ReadOnly[str]
 
 
+@with_config(ConfigDict(extra="allow", strict=True))
+class _PredibaseDetails(TypedDict, total=False):
+    finish_reason: ReadOnly[str | None]
+
+
+@with_config(ConfigDict(extra="allow", strict=True))
+class _PredibaseStreamData(TypedDict, total=False):
+    token: ReadOnly[_PredibaseToken]
+    details: ReadOnly[_PredibaseDetails | None]
+    generated_text: ReadOnly[str | None]
+    error: ReadOnly[str | None]
+
+
+@with_config(ConfigDict(extra="allow", strict=True))
 class _NlpCloudStreamData(TypedDict):
-    generated_text: str
+    generated_text: ReadOnly[str]
 
 
 class _AlephAlphaStreamData(TypedDict):
     completions: Sequence[Mapping[str, str]]
+
+
+_PREDIBASE_STREAM_DATA: Final = TypeAdapter(_PredibaseStreamData)
+_NLP_CLOUD_STREAM_DATA: Final = TypeAdapter(_NlpCloudStreamData)
 
 
 class _DeltaDumpDict(TypedDict):
@@ -569,13 +585,15 @@ class CustomStreamWrapper:
             finish_reason = ""
             print_verbose(f"chunk: {chunk}")
             if chunk.startswith("data:"):
-                data_json: Final[_PredibaseStreamData] = json.loads(chunk[5:])
+                data_json: Final[_PredibaseStreamData] = _PREDIBASE_STREAM_DATA.validate_python(json.loads(chunk[5:]))
                 print_verbose(f"data json: {data_json}")
                 if "token" in data_json and "text" in data_json["token"]:
                     text = data_json["token"]["text"]
-                if data_json.get("details", False) and data_json["details"].get("finish_reason", False):
+                details: Final = data_json.get("details")
+                details_finish_reason: Final = details.get("finish_reason", False) if details else False
+                if details and details_finish_reason:
                     is_finished = True
-                    finish_reason = data_json["details"]["finish_reason"]
+                    finish_reason = details_finish_reason
                 elif data_json.get("generated_text", False):  # if full generated text exists, then stream is complete
                     text = ""  # don't return the final bos token
                     is_finished = True
@@ -605,7 +623,7 @@ class CustomStreamWrapper:
             if self.model and "dolphin" in self.model:
                 chunk = self.process_chunk(chunk=chunk)
             else:
-                data_json: Final[_NlpCloudStreamData] = json.loads(chunk)
+                data_json: Final = _NLP_CLOUD_STREAM_DATA.validate_python(json.loads(chunk))
                 chunk = data_json["generated_text"]
             text = chunk
             if "[DONE]" in text:

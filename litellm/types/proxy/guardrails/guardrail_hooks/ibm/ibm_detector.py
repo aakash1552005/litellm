@@ -1,3 +1,4 @@
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic import Field
@@ -15,14 +16,14 @@ class IBMDetectorRequestBodyDetectorServer(TypedDict):
     """Request body for calling IBM Detector Server directly"""
 
     contents: list[str]
-    detector_params: dict[str, Any]
+    detector_params: Mapping[str, object]
 
 
 class IBMDetectorRequestBodyOrchestrator(TypedDict):
     """Request body for calling IBM Detector via FMS Guardrails Orchestrator"""
 
     content: str
-    detectors: dict[str, dict[str, Any]]
+    detectors: Mapping[str, Mapping[str, object]]
 
 
 class IBMDetectorDetection(TypedDict, total=False):
@@ -34,8 +35,8 @@ class IBMDetectorDetection(TypedDict, total=False):
     detection: str
     detection_type: str
     score: float
-    evidences: list[Any]
-    metadata: dict[str, Any]
+    evidences: Sequence[object]
+    metadata: Mapping[str, object]
     detector_id: str | None  # Only present in orchestrator response
 
 
@@ -57,7 +58,7 @@ class IBMDetectorResponseOrchestrator(TypedDict):
 class IBMDetectorOptionalParams(LiteLLMBaseModel):
     """Optional parameters for IBM Detector guardrail"""
 
-    detector_params: dict[str, Any] | None = Field(
+    detector_params: dict[str, object] | None = Field(
         default_factory=lambda: {},
         description="Dictionary of arguments to pass to the detector.",
     )
