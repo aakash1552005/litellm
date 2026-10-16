@@ -1,9 +1,6 @@
-from collections.abc import Sequence
 from typing import Final
 
 import httpx
-from pydantic import ConfigDict, TypeAdapter, with_config
-from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 from litellm.llms.base_llm.chat.transformation import AllMessageValues, BaseLLMException
 from litellm.llms.base_llm.embedding.transformation import (
@@ -15,22 +12,6 @@ from litellm.types.utils import EmbeddingResponse, Usage
 from litellm.utils import token_counter
 
 from ..common_utils import TritonError
-
-
-@with_config(ConfigDict(extra="allow", strict=True))
-class _TritonEmbeddingOutput(TypedDict):
-    shape: ReadOnly[Sequence[int]]
-    data: ReadOnly[Sequence[int | float]]
-
-
-@with_config(ConfigDict(extra="allow", strict=True))
-class _TritonEmbeddingBody(TypedDict):
-    outputs: ReadOnly[Sequence[_TritonEmbeddingOutput]]
-    model_name: NotRequired[ReadOnly[str]]
-
-
-_PARSED_JSON: Final = TypeAdapter(object)
-_TRITON_EMBEDDING_BODY: Final = TypeAdapter(_TritonEmbeddingBody)
 
 
 class TritonEmbeddingConfig(BaseEmbeddingConfig):
@@ -98,11 +79,10 @@ class TritonEmbeddingConfig(BaseEmbeddingConfig):
         litellm_params: dict = {},
     ) -> EmbeddingResponse:
         try:
-            parsed_json: Final = _PARSED_JSON.validate_python(raw_response.json())
+            raw_response_json: Final = raw_response.json()
         except Exception:
             raise TritonError(message=raw_response.text, status_code=raw_response.status_code)
 
-        raw_response_json: Final = _TRITON_EMBEDDING_BODY.validate_python(parsed_json)
         _embedding_output: Final = []
 
         _outputs: Final = raw_response_json["outputs"]
@@ -154,7 +134,7 @@ class TritonEmbeddingConfig(BaseEmbeddingConfig):
         return TritonError(message=error_message, status_code=status_code, headers=headers)
 
     @staticmethod
-    def split_embedding_by_shape(data: Sequence[float], shape: Sequence[int]) -> list[Sequence[float]]:
+    def split_embedding_by_shape(data: list[float], shape: list[int]) -> list[list[float]]:
         if len(shape) != 2:
             raise ValueError("Shape must be of length 2.")
         embedding_size: Final = shape[1]
