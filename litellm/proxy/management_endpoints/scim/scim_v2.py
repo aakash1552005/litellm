@@ -24,6 +24,7 @@ from fastapi import (
     Response,
 )
 from pydantic import TypeAdapter, ValidationError
+from pydantic.fields import FieldInfo
 from typing_extensions import ReadOnly, TypedDict, assert_never
 
 import litellm
@@ -2271,6 +2272,165 @@ def _handle_multi_valued_attribute_update(path: str, op_type: str, value: object
     metadata[metadata_key] = dumped
 
 
+def _enterprise_extension_sub_path(path: str) -> str | None:
+    schema: Final = SCIM_ENTERPRISE_USER_SCHEMA
+    if path.casefold() == schema.casefold():
+        return ""
+    prefix: Final = f"{schema}:"
+    if path.casefold().startswith(prefix.casefold()):
+        return path[len(prefix) :]
+    return None
+
+
+def _scim_model_field_names(model_fields: Mapping[str, FieldInfo]) -> Mapping[str, str]:
+    return {
+        **{field_name.casefold(): field_name for field_name in model_fields},
+        **{
+            field.alias.casefold(): field_name
+            for field_name, field in model_fields.items()
+            if isinstance(field.alias, str)
+        },
+    }
+
+
+def _canonicalize_scim_model_data(
+    value: Mapping[str, object],
+    model_fields: Mapping[str, FieldInfo],
+) -> Mapping[str, object]:
+    field_names: Final = _scim_model_field_names(model_fields)
+    return {field_names.get(key.casefold(), key): field_value for key, field_value in value.items()}
+
+
+def _canonicalize_enterprise_data(value: Mapping[str, object]) -> Mapping[str, object]:
+    enterprise_data: Final = _canonicalize_scim_model_data(value, SCIMEnterpriseUser.model_fields)
+    manager: Final = enterprise_data.get("manager")
+    if isinstance(manager, str):
+        return {**enterprise_data, "manager": {"value": manager}}
+    if not isinstance(manager, dict):
+        return enterprise_data
+    return {
+        **enterprise_data,
+        "manager": _canonicalize_scim_model_data(
+            _JSON_OBJECT_ADAPTER.validate_python(manager),
+            SCIMUserManager.model_fields,
+        ),
+    }
+
+
+def _merge_enterprise_data(
+    existing: Mapping[str, object],
+    incoming: Mapping[str, object],
+    op_type: str,
+    incoming_manager_is_object: bool,
+) -> Mapping[str, object]:
+    merged: Final[Mapping[str, object]] = {**existing, **incoming}
+    existing_manager: Final = existing.get("manager")
+    incoming_manager: Final = incoming.get("manager")
+    if (
+        op_type == "add"
+        and incoming_manager_is_object
+        and isinstance(existing_manager, dict)
+        and isinstance(incoming_manager, dict)
+    ):
+        existing_manager_data: Final = _JSON_OBJECT_ADAPTER.validate_python(existing_manager)
+        incoming_manager_data: Final = _JSON_OBJECT_ADAPTER.validate_python(incoming_manager)
+        return {**merged, "manager": {**existing_manager_data, **incoming_manager_data}}
+    return merged
+
+
+def _validate_enterprise_update(value: Mapping[str, object]) -> Mapping[str, object] | None:
+    try:
+        enterprise: Final = SCIMEnterpriseUser.model_validate(value)
+    except ValidationError:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "Invalid value for the enterprise extension"},
+        )
+    dumped: Final = enterprise.model_dump(by_alias=True, exclude_none=True)
+    return dumped if dumped else None
+
+
+def _handle_enterprise_update(
+    sub_path: str,
+    op_type: str,
+    value: object,
+    metadata: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    if op_type == "remove" and not sub_path:
+        return None
+
+    stored_enterprise: Final = metadata.get(SCIM_ENTERPRISE_METADATA_KEY)
+    existing: Final[Mapping[str, object]] = (
+        _canonicalize_enterprise_data(_JSON_OBJECT_ADAPTER.validate_python(stored_enterprise))
+        if isinstance(stored_enterprise, dict)
+        else {}
+    )
+
+    if not sub_path:
+        if not isinstance(value, dict):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "The enterprise extension value must be an object"},
+            )
+        incoming_value: Final = _JSON_OBJECT_ADAPTER.validate_python(value)
+        incoming: Final = _canonicalize_enterprise_data(incoming_value)
+        incoming_manager_is_object: Final = isinstance(incoming_value.get("manager"), dict)
+        return _validate_enterprise_update(
+            _merge_enterprise_data(existing, incoming, op_type, incoming_manager_is_object)
+        )
+
+    path_parts: Final = sub_path.split(".")
+    if len(path_parts) == 1:
+        field_name: Final = _scim_model_field_names(SCIMEnterpriseUser.model_fields).get(sub_path.casefold())
+        if field_name is None:
+            return _validate_enterprise_update(existing)
+        if op_type == "remove":
+            return _validate_enterprise_update({key: attr for key, attr in existing.items() if key != field_name})
+        if value is None:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": f"The {op_type} operation requires a 'value' member"},
+            )
+        field_incoming: Final = _canonicalize_enterprise_data({field_name: value})
+        field_incoming_manager_is_object: Final = field_name == "manager" and isinstance(value, dict)
+        return _validate_enterprise_update(
+            _merge_enterprise_data(existing, field_incoming, op_type, field_incoming_manager_is_object)
+        )
+
+    if len(path_parts) == 2 and path_parts[0].casefold() == "manager":
+        manager_field: Final = _scim_model_field_names(SCIMUserManager.model_fields).get(path_parts[1].casefold())
+        if manager_field is None:
+            return _validate_enterprise_update(existing)
+        existing_manager: Final = existing.get("manager")
+        manager_data: Final[Mapping[str, object]] = (
+            _canonicalize_scim_model_data(
+                _JSON_OBJECT_ADAPTER.validate_python(existing_manager),
+                SCIMUserManager.model_fields,
+            )
+            if isinstance(existing_manager, dict)
+            else {}
+        )
+        if op_type == "remove":
+            removed_manager: Final[Mapping[str, object]] = {
+                key: attr for key, attr in manager_data.items() if key != manager_field
+            }
+            updated_enterprise: Final[Mapping[str, object]] = (
+                {**existing, "manager": removed_manager}
+                if removed_manager
+                else {key: attr for key, attr in existing.items() if key != "manager"}
+            )
+            return _validate_enterprise_update(updated_enterprise)
+        if value is None:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": f"The {op_type} operation requires a 'value' member"},
+            )
+        updated_manager: Final[Mapping[str, object]] = {**manager_data, manager_field: value}
+        return _validate_enterprise_update({**existing, "manager": updated_manager})
+
+    return _validate_enterprise_update(existing)
+
+
 def _handle_generic_metadata(path: str, op_type: str, value: object, metadata: dict[str, object]) -> None:
     """Handle generic metadata operations for unknown paths."""
     if op_type == "remove":
@@ -2285,22 +2445,38 @@ def _apply_patch_ops(
 ) -> tuple[dict[str, object], set[str]]:
     """Apply patch operations and return update data and final team set."""
     update_data: Final[dict[str, object]] = {}
-    metadata: Final = existing_user.metadata or {}
-    scim_metadata: Final = metadata.get("scim_metadata", {})
+    stored_metadata: Final[object] = TypeAdapter(object).validate_python(existing_user.model_dump().get("metadata"))
+    metadata: Final = _JSON_OBJECT_ADAPTER.validate_python(stored_metadata) if isinstance(stored_metadata, dict) else {}
+    stored_scim_metadata: Final = metadata.get("scim_metadata")
+    scim_metadata: Final = (
+        _JSON_OBJECT_ADAPTER.validate_python(stored_scim_metadata) if isinstance(stored_scim_metadata, dict) else {}
+    )
 
     teams_set: Final[set[str]] = set(existing_user.teams or [])
     replace_team_set: set[str] | None = None
 
     for op in patch_ops.Operations:
-        path = (op.path or "").lower()
+        path = op.path.lower() if isinstance(op.path, str) else ""
         value = op.value
         op_type = op.op
 
         # Handle SCIM operations without path where value contains the fields
         if not path and isinstance(value, dict):
-            for key, val in value.items():
+            for key, val in _JSON_OBJECT_ADAPTER.validate_python(value).items():
                 key_lower = key.lower()
-                if key_lower == "active":
+                if (enterprise_key_sub_path := _enterprise_extension_sub_path(key)) is not None:
+                    if (
+                        enterprise_data := _handle_enterprise_update(
+                            enterprise_key_sub_path,
+                            op_type,
+                            val,
+                            metadata,
+                        )
+                    ) is None:
+                        metadata.pop(SCIM_ENTERPRISE_METADATA_KEY, None)
+                    else:
+                        metadata[SCIM_ENTERPRISE_METADATA_KEY] = enterprise_data
+                elif key_lower == "active":
                     _handle_active_update(op_type, val, metadata)
                 elif key_lower == "displayname":
                     _handle_displayname_update(op_type, val, update_data)
@@ -2309,7 +2485,7 @@ def _apply_patch_ops(
                 elif key_lower in SCIM_MULTI_VALUED_ATTRIBUTE_METADATA_KEYS:
                     _handle_multi_valued_attribute_update(key_lower, op_type, val, metadata)
                 elif key_lower == "name" and isinstance(val, dict):
-                    for name_key, name_val in val.items():
+                    for name_key, name_val in _JSON_OBJECT_ADAPTER.validate_python(val).items():
                         name_key_lower = name_key.lower()
                         if name_key_lower in ("givenname", "familyname"):
                             _handle_name_update(
@@ -2334,6 +2510,18 @@ def _apply_patch_ops(
             new_replace_set = _handle_group_operations(op_type, value, teams_set, op.path)
             if new_replace_set is not None:
                 replace_team_set = new_replace_set
+        elif (enterprise_sub_path := _enterprise_extension_sub_path(path)) is not None:
+            if (
+                enterprise_data := _handle_enterprise_update(
+                    enterprise_sub_path,
+                    op_type,
+                    value,
+                    metadata,
+                )
+            ) is None:
+                metadata.pop(SCIM_ENTERPRISE_METADATA_KEY, None)
+            else:
+                metadata[SCIM_ENTERPRISE_METADATA_KEY] = enterprise_data
         else:
             _handle_generic_metadata(path, op_type, value, metadata)
 
