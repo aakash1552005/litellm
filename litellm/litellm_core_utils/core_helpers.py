@@ -50,6 +50,7 @@ def safe_divide_seconds(seconds: float, denominator: float, default: float | Non
 
 
 _DROP_PARAMS_BOOL: Final = TypeAdapter(bool)
+_DICT_STR_OBJECT_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 
 
 def as_str_mapping(value: object) -> Mapping[str, object] | None:
@@ -559,7 +560,8 @@ def preserve_upstream_non_openai_attributes(
     """
     # Access model_fields on the class, not the instance, to avoid Pydantic 2.11+ deprecation warnings
     expected_keys: Final = set(type(model_response).model_fields.keys()).union({"usage"})
-    for key, value in original_chunk.model_dump().items():
+    dumped: Final[Mapping[str, object]] = _DICT_STR_OBJECT_ADAPTER.validate_python(original_chunk.model_dump())
+    for key, value in dumped.items():
         if key not in expected_keys:
             setattr(model_response, key, value)
 
