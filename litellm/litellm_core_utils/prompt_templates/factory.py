@@ -12,7 +12,7 @@ from types import MappingProxyType
 from typing import Any, Final, TypeAlias, TypedDict, cast, overload
 
 from jinja2.sandbox import ImmutableSandboxedEnvironment
-from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
+from pydantic import BaseModel, JsonValue, TypeAdapter
 
 import litellm
 import litellm.types
@@ -219,8 +219,6 @@ def _handle_ollama_system_message(messages: list, prompt: str, msg_i: int) -> tu
 
 _OLLAMA_USER_ROLES: Final = frozenset({"user", "tool", "function"})
 _DECODED_JSON: Final = TypeAdapter(object)
-_JSON_VALUE_ADAPTER: Final[TypeAdapter[JsonValue]] = TypeAdapter(JsonValue, config=ConfigDict(strict=True))
-_JSON_OBJECT_ADAPTER: Final = TypeAdapter(dict[str, JsonValue], config=ConfigDict(strict=True))
 
 
 def _ollama_bad_message(model: str, message: AllMessageValues, msg_i: int, detail: str) -> "litellm.BadRequestError":
@@ -1021,8 +1019,8 @@ def convert_to_anthropic_tool_invoke_xml(tool_calls: list) -> str:
         tool_function = get_attribute_or_key(tool, "function")
         tool_name = get_attribute_or_key(tool_function, "name")
         tool_arguments = get_attribute_or_key(tool_function, "arguments")
-        parsed_args: JsonValue = _JSON_VALUE_ADAPTER.validate_python(
-            parse_tool_call_arguments(tool_arguments, tool_name=tool_name, context="Anthropic XML tool invoke")
+        parsed_args = parse_tool_call_arguments(
+            tool_arguments, tool_name=tool_name, context="Anthropic XML tool invoke"
         )
         if isinstance(parsed_args, dict):
             parameters = "".join(f"<{param}>{val}</{param}>\n" for param, val in parsed_args.items())
@@ -1628,7 +1626,7 @@ def convert_to_gemini_tool_call_result(
     try:
         if content_str.strip().startswith("{") or content_str.strip().startswith("["):
             # Try to parse as JSON (for Computer Use structured responses)
-            parsed: Final[JsonValue] = _JSON_VALUE_ADAPTER.validate_python(json.loads(content_str))
+            parsed: Final[JsonValue] = json.loads(content_str)
             if isinstance(parsed, dict) and not (_may_spell_ref_key(content_str) and _contains_part_reference(parsed)):
                 response_data = parsed  # Use the parsed JSON directly
             else:
@@ -5766,10 +5764,10 @@ def get_attribute_or_key(tool_or_function, attribute, default=None):
 class NormalizedToolCall(TypedDict):
     id: str | None
     name: str | None
-    arguments: Mapping[str, object]
+    arguments: dict[str, object]
 
 
-_ArgumentObjects: TypeAlias = tuple[Mapping[str, object], ...]
+_ArgumentObjects: TypeAlias = tuple[dict[str, object], ...]
 _ParsedToolCall: TypeAlias = tuple[str | None, str | None, _ArgumentObjects]
 
 
@@ -5818,9 +5816,7 @@ def _parse_tool_call_arguments(raw: object, tool_name: str | None, context: str)
         return ({},)
     normalized_raw: Final = "{}" if raw == REDACTED_BY_LITELLM else raw
     try:
-        parsed: Final[JsonValue] = _JSON_VALUE_ADAPTER.validate_python(
-            parse_tool_call_arguments(normalized_raw, tool_name=tool_name, context=context)
-        )
+        parsed: Final = parse_tool_call_arguments(normalized_raw, tool_name=tool_name, context=context)
     except ValueError as e:
         salvaged: Final = salvage_concatenated_tool_arguments(normalized_raw)
         if salvaged:
@@ -5830,7 +5826,7 @@ def _parse_tool_call_arguments(raw: object, tool_name: str | None, context: str)
                 tool_name or "<unknown>",
                 context,
             )
-            return tuple(_JSON_OBJECT_ADAPTER.validate_python(item) for item in salvaged)
+            return salvaged
         verbose_logger.warning("Failed to parse tool call arguments: %s", e)
         return ({},)
     return (parsed,) if isinstance(parsed, dict) else ({},)
