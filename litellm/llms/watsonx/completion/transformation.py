@@ -1,11 +1,9 @@
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
-from pydantic import ConfigDict, TypeAdapter, with_config
-from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionUsageBlock
@@ -29,24 +27,6 @@ if TYPE_CHECKING:
     LiteLLMLoggingObj = _LiteLLMLoggingObj
 else:
     LiteLLMLoggingObj = Any
-
-
-@with_config(ConfigDict(extra="allow", strict=True))
-class _WatsonXResult(TypedDict):
-    generated_text: ReadOnly[str]
-    input_token_count: ReadOnly[int]
-    generated_token_count: ReadOnly[int]
-    stop_reason: ReadOnly[str]
-
-
-@with_config(ConfigDict(extra="allow", strict=True))
-class _WatsonXResponse(TypedDict):
-    results: ReadOnly[NotRequired[Sequence[_WatsonXResult]]]
-    model_id: ReadOnly[NotRequired[str | None]]
-    created_at: ReadOnly[NotRequired[str | None]]
-
-
-_WATSONX_RESPONSE_ADAPTER: Final = TypeAdapter(_WatsonXResponse)
 
 
 class IBMWatsonXAIConfig(IBMWatsonXMixin, BaseConfig):
@@ -293,7 +273,7 @@ class IBMWatsonXAIConfig(IBMWatsonXMixin, BaseConfig):
         self,
         model: str,
         raw_response: httpx.Response,
-        model_response: ModelResponse | None,
+        model_response: ModelResponse,
         logging_obj: LiteLLMLoggingObj,
         request_data: dict,
         messages: list[AllMessageValues],
@@ -310,37 +290,36 @@ class IBMWatsonXAIConfig(IBMWatsonXMixin, BaseConfig):
             original_response=raw_response.text,
         )
 
-        json_resp: Final = _WATSONX_RESPONSE_ADAPTER.validate_python(raw_response.json())
+        json_resp: Final = raw_response.json()
+
         if "results" not in json_resp:
             raise WatsonXAIError(
                 status_code=500,
                 message=f"Error: Invalid response from Watsonx.ai API: {json_resp}",
             )
-        response: Final = (
-            model_response if model_response is not None else ModelResponse(model=json_resp.get("model_id"))
-        )
+        if model_response is None:
+            model_response = ModelResponse(model=json_resp.get("model_id", None))
         generated_text: Final = json_resp["results"][0]["generated_text"]
         prompt_tokens: Final = json_resp["results"][0]["input_token_count"]
         completion_tokens: Final = json_resp["results"][0]["generated_token_count"]
-        response.choices[0].message.content = generated_text
-        response.choices[0].finish_reason = map_finish_reason(json_resp["results"][0]["stop_reason"])
-        created_at: Final = json_resp.get("created_at")
-        if created_at:
+        model_response.choices[0].message.content = generated_text
+        model_response.choices[0].finish_reason = map_finish_reason(json_resp["results"][0]["stop_reason"])
+        if json_resp.get("created_at"):
             try:
-                created_datetime = datetime.fromisoformat(created_at)
+                created_datetime = datetime.fromisoformat(json_resp["created_at"])
             except ValueError:
                 # datetime.fromisoformat cannot handle 'Z' in Python 3.10
-                created_datetime = datetime.fromisoformat(f"{created_at.rstrip('Z')}+00:00")
-            response.created = int(created_datetime.timestamp())
+                created_datetime = datetime.fromisoformat(f"{json_resp['created_at'].rstrip('Z')}+00:00")
+            model_response.created = int(created_datetime.timestamp())
         else:
-            response.created = int(time.time())
+            model_response.created = int(time.time())
         usage: Final = Usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
         )
-        setattr(response, "usage", usage)
-        return response
+        setattr(model_response, "usage", usage)
+        return model_response
 
     def get_complete_url(
         self,
