@@ -1,15 +1,16 @@
 # stdlib imports
 import re
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 # third party imports
 import click
 import rich
 import yaml
+from pydantic import ConfigDict, TypeAdapter, with_config
 from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 # local imports
@@ -43,13 +44,36 @@ class ModelYamlInfo:
         return ", ".join(self.access_groups) if self.access_groups else ""
 
 
-def _get_model_info_obj_from_yaml(model: dict[str, Any]) -> ModelYamlInfo:
+@with_config(ConfigDict(extra="allow", strict=True))
+class _YamlModel(TypedDict):
+    model_name: ReadOnly[str]
+    litellm_params: ReadOnly[dict[str, object]]
+    model_info: ReadOnly[NotRequired[dict[str, object]]]
+
+
+@with_config(ConfigDict(extra="allow", strict=True))
+class _YamlLitellmParams(TypedDict):
+    model: ReadOnly[str]
+
+
+@with_config(ConfigDict(extra="allow", strict=True))
+class _YamlModelInfo(TypedDict):
+    access_groups: ReadOnly[NotRequired[list[str]]]
+
+
+_YAML_MODEL: Final = TypeAdapter(_YamlModel)
+_YAML_LITELLM_PARAMS: Final = TypeAdapter(_YamlLitellmParams)
+_YAML_MODEL_INFO: Final = TypeAdapter(_YamlModelInfo)
+
+
+def _get_model_info_obj_from_yaml(model: object) -> ModelYamlInfo:
     """Extract model info from a model dict and return as ModelYamlInfo dataclass."""
-    model_name: Final[str] = model["model_name"]
-    model_params: Final[dict[str, Any]] = model["litellm_params"]
-    model_info: Final[dict[str, Any]] = model.get("model_info", {})
-    model_id: Final[str] = model_params["model"]
-    access_groups: Final = model_info.get("access_groups", [])
+    validated_model: Final = _YAML_MODEL.validate_python(model)
+    model_name: Final = validated_model["model_name"]
+    model_params: Final = validated_model["litellm_params"]
+    model_info: Final = validated_model.get("model_info", {})
+    model_id: Final = _YAML_LITELLM_PARAMS.validate_python(model_params)["model"]
+    access_groups: Final = _YAML_MODEL_INFO.validate_python(model_info).get("access_groups", [])
     provider: Final = model_id.split("/", 1)[0] if "/" in model_id else model_id
     return ModelYamlInfo(
         model_name=model_name,
@@ -59,6 +83,10 @@ def _get_model_info_obj_from_yaml(model: dict[str, Any]) -> ModelYamlInfo:
         access_groups=access_groups,
         provider=provider,
     )
+
+
+def _str_field(model: Mapping[str, object], key: str, default: str) -> str:
+    return str(model.get(key, default))
 
 
 def format_iso_datetime_str(iso_datetime_str: str | None) -> str:
@@ -142,10 +170,10 @@ def list_models(ctx: click.Context, output_format: Literal["table", "json"]) -> 
                 created = int(created)
 
             table.add_row(
-                str(model.get("id", "")),
-                str(model.get("object", "model")),
+                _str_field(model, "id", ""),
+                _str_field(model, "object", "model"),
                 (format_timestamp(created) if isinstance(created, int) else format_iso_datetime_str(created)),
-                str(model.get("owned_by", "")),
+                _str_field(model, "owned_by", ""),
             )
 
         rich.print(table)
